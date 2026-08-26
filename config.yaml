@@ -1,0 +1,91 @@
+# Relative paths are resolved from this file's directory. For UNC paths, prefer
+# single quotes, for example: '\\DESKTOP-NAME\share\images'.
+watch:
+  paths:
+    - samples/incoming
+  recursive: true
+  # polling is the safest default for UNC/network shares; watchdog is event-based.
+  mode: polling
+  polling_interval_seconds: 5
+  file_stable_seconds: 2
+
+output:
+  directory: output
+  # copy is the safe default. Nothing is ever deleted automatically.
+  operation: copy
+  preserve_relative_paths: true
+
+# codex_cli uses the ChatGPT Pro Codex allowance when Codex is signed in with
+# ChatGPT. Switch this to lmstudio to use the local VLM section below.
+classifier:
+  backend: codex_cli
+
+codex_cli:
+  executable: codex
+  model: gpt-5.6-luna
+  reasoning_effort: low
+  timeout_seconds: 180
+  retries: 1
+  retry_delay_seconds: 2
+  max_image_dimension: 2048
+  jpeg_quality: 90
+  working_directory: cache/codex-cli
+  # Stop before sending an image if Codex is signed in with an API key.
+  require_chatgpt_login: true
+  # Avoid loading MCP/config extras; authentication is still read by Codex.
+  ignore_user_config: true
+  ephemeral: true
+
+# Retained as a fully supported local/offline fallback backend.
+lmstudio:
+  base_url: http://127.0.0.1:1234/v1
+  model: qwen3-vl-8b
+  timeout_seconds: 120
+  retries: 2
+  retry_delay_seconds: 2
+  max_image_dimension: 2048
+  jpeg_quality: 90
+
+processing:
+  # LM Studio commonly performs best with 1 worker; raise only after testing.
+  parallel_workers: 1
+  extensions: [.png, .jpg, .jpeg, .webp]
+
+rules:
+  threshold_pass: 0.85
+  threshold_review: 0.50
+  score_review_below: 6
+  score_fail_below: 3
+  fail_score_count: 2
+  review_problem_keywords:
+    - extra finger
+    - missing finger
+    - fused finger
+    - deformed hand
+    - extra limb
+    - missing limb
+    - fused body
+    - fused object
+    - malformed anatomy
+  fail_problem_keywords:
+    - severe deformation
+    - major anatomy failure
+    - multiple extra limbs
+    - unrecognizable face
+    - heavy generation noise
+
+logs:
+  directory: logs
+  results_jsonl: results.jsonl
+  summary_csv: latest_summary.csv
+  application_log: app.log
+
+cache:
+  directory: cache
+  processed_file: processed.json
+  use_content_hash: true
+
+report:
+  filename: review.html
+  thumbnail_width: 320
+  thumbnail_height: 320
