@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from typing import Any, Callable, Mapping, Sequence
@@ -66,6 +67,7 @@ class CodexCLIClientConfig:
     require_chatgpt_login: bool = True
     ignore_user_config: bool = True
     ephemeral: bool = True
+    review_mode: str = "standard"
 
 
 CommandRunner = Callable[..., subprocess.CompletedProcess[str]]
@@ -81,6 +83,11 @@ def config_from_settings(settings: object | None = None, **overrides: Any) -> Co
     """Adapt ``AppConfig.codex_cli`` or a compatible mapping/object."""
 
     source = settings
+    rules = _setting(settings, "rules", None) if settings is not None else None
+    review_mode = overrides.get(
+        "review_mode",
+        _setting(rules, "mode", _setting(source, "review_mode", "standard")),
+    )
     nested = _setting(source, "codex_cli", None) if source is not None else None
     if nested is not None:
         source = nested
@@ -102,6 +109,7 @@ def config_from_settings(settings: object | None = None, **overrides: Any) -> Co
         require_chatgpt_login=bool(value("require_chatgpt_login")),
         ignore_user_config=bool(value("ignore_user_config")),
         ephemeral=bool(value("ephemeral")),
+        review_mode=str(review_mode).strip().lower(),
     )
 
 
@@ -145,6 +153,12 @@ class CodexCLIClient:
         timeout: float | None = None,
     ) -> subprocess.CompletedProcess[str]:
         self.config.working_directory.mkdir(parents=True, exist_ok=True)
+        process_options: dict[str, Any] = {}
+        if sys.platform == "win32":
+            # pythonw has no parent console. Without this flag, invoking the
+            # codex.cmd wrapper creates a short-lived console window for every
+            # version, login-status, and image-classification subprocess.
+            process_options["creationflags"] = subprocess.CREATE_NO_WINDOW
         try:
             return self._runner(
                 list(args),
@@ -156,6 +170,7 @@ class CodexCLIClient:
                 check=False,
                 encoding="utf-8",
                 errors="replace",
+                **process_options,
             )
         except subprocess.TimeoutExpired as exc:
             raise CodexCLIError(
@@ -246,12 +261,11 @@ class CodexCLIClient:
         command.append("-")
         return command
 
-    @staticmethod
-    def _prompt(image_name: str | None) -> str:
+    def _prompt(self, image_name: str | None) -> str:
         return (
-            build_system_prompt()
+            build_system_prompt(self.config.review_mode)
             + "\n\n"
-            + build_user_prompt(image_name)
+            + build_user_prompt(image_name, mode=self.config.review_mode)
             + "\n\nAnalyze only the attached image. Do not inspect repository files, run shell "
             "commands, use external tools, or modify any file. Return only the requested JSON object."
         )

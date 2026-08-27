@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import subprocess
+import sys
 from typing import Any, Sequence
 
 import pytest
@@ -102,6 +103,12 @@ def test_classify_uses_image_schema_read_only_and_chatgpt_auth(tmp_path: Path) -
     assert "--ephemeral" in exec_args
     assert exec_args[-1] == "-"
     assert "Analyze only the attached image" in kwargs["input"]
+    assert "Inspection mode: STANDARD" in kwargs["input"]
+    assert "intentional anatomical exaggeration" in kwargs["input"]
+    if sys.platform == "win32":
+        assert kwargs["creationflags"] == subprocess.CREATE_NO_WINDOW
+    else:
+        assert "creationflags" not in kwargs
     assert runner.schemas[0]["additionalProperties"] is False
     assert set(runner.schemas[0]["required"]) == {
         "result",

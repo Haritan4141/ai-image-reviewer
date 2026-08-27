@@ -13,6 +13,13 @@ def _record(source: Path, destination: Path, label: str, timestamp: str) -> dict
         "destination_path": str(destination),
         "file_hash": f"hash-{label}",
         "result": label,
+        "model_result": label,
+        "final_result": label,
+        "decision_source": "model",
+        "review_mode": "standard",
+        "low_scores": {},
+        "keyword_hits": {},
+        "rule_reasons": [],
         "confidence": 0.93 if label == "PASS" else 0.45,
         "scores": {"hands": 8},
         "problems": [] if label == "PASS" else ["deformed hand"],
@@ -53,12 +60,15 @@ def test_report_builder_persists_jsonl_csv_and_filterable_html(tmp_path: Path) -
         rows = list(csv.DictReader(stream))
     assert [row["result"] for row in rows] == ["PASS", "REVIEW"]
     assert rows[1]["problems"] == "deformed hand"
+    assert rows[0]["model_result"] == "PASS"
+    assert rows[0]["final_result"] == "PASS"
 
     html = paths["html"].read_text(encoding="utf-8")
     assert 'data-result="PASS"' in html
     assert 'data-result="REVIEW"' in html
     assert 'data-filter="FAIL"' in html
     assert "confidence 0.93" in html
+    assert "<strong>Model</strong> PASS" in html
     assert "&lt;summary&gt;" in html
     assert "output/pass/pass.png" in html
 

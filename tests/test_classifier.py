@@ -23,23 +23,43 @@ def _result(
 
 
 def test_low_confidence_pass_is_promoted_to_review() -> None:
-    result = apply_local_rules(_result(confidence=0.84))
+    result = apply_local_rules(_result(confidence=0.79))
 
     assert result.result is ResultLabel.REVIEW
+    assert result.decision_source == "local_rules"
 
 
-def test_explicit_fail_is_never_relaxed() -> None:
+def test_standard_mode_downgrades_uncorroborated_model_fail_to_review() -> None:
     result = apply_local_rules(_result(ResultLabel.FAIL, confidence=1.0))
+
+    assert result.model_result is ResultLabel.FAIL
+    assert result.result is ResultLabel.REVIEW
+    assert result.decision_source == "local_rules"
+
+
+def test_strict_mode_preserves_explicit_model_fail() -> None:
+    result = apply_local_rules(
+        _result(ResultLabel.FAIL, confidence=1.0),
+        LocalRulesConfig(mode="strict"),
+    )
 
     assert result.result is ResultLabel.FAIL
 
 
-def test_severe_keyword_or_multiple_low_scores_promotes_to_fail() -> None:
-    keyword_result = apply_local_rules(_result(problems=["severe deformation detected"]))
-    score_result = apply_local_rules(_result(scores=ScoreSet(2, 2, 8, 8, 8)))
+def test_standard_mode_requires_keyword_and_multiple_extreme_scores_for_fail() -> None:
+    keyword_only = apply_local_rules(_result(problems=["severe deformation detected"]))
+    scores_only = apply_local_rules(_result(scores=ScoreSet(1, 1, 8, 8, 8)))
+    corroborated = apply_local_rules(
+        _result(
+            problems=["severe deformation detected"],
+            scores=ScoreSet(1, 1, 8, 8, 8),
+        )
+    )
 
-    assert keyword_result.result is ResultLabel.FAIL
-    assert score_result.result is ResultLabel.FAIL
+    assert keyword_only.result is ResultLabel.PASS
+    assert scores_only.result is ResultLabel.REVIEW
+    assert corroborated.result is ResultLabel.FAIL
+    assert corroborated.decision_source == "local_rules"
 
 
 def test_review_keyword_promotes_high_confidence_pass_to_review() -> None:
@@ -56,6 +76,17 @@ def test_custom_rules_are_applied_without_mutating_input() -> None:
 
     assert source.result is ResultLabel.PASS
     assert result.result is ResultLabel.PASS
+
+
+def test_local_rules_are_idempotent_and_keep_original_model_result() -> None:
+    source = _result(ResultLabel.FAIL)
+
+    first = apply_local_rules(source)
+    second = apply_local_rules(first, LocalRulesConfig(mode="strict"))
+
+    assert first is second
+    assert second.model_result is ResultLabel.FAIL
+    assert second.result is ResultLabel.REVIEW
 
 
 class _Client:

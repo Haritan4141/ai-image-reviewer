@@ -16,6 +16,20 @@ python main.py --config config.local.yaml <command>
 python main.py --help
 ```
 
+## デスクトップGUI
+
+エクスプローラーで`start-gui.cmd`をダブルクリックするか、次のコマンドで起動します。
+
+```powershell
+python gui.py
+```
+
+GUIは設定を`config.local.yaml`へ保存します。バックエンド／モデル／推論設定／判定基準、入力・出力、`copy` / `move`、一括スキャン、継続監視、接続確認、レポート表示を画面から操作できます。判定基準は`緩め`、`標準（推奨）`、`厳格`から選択でき、高度な閾値やタイムアウトは`config.local.yaml`を直接編集できます。
+
+停止は現在処理中の1枚が完了した時点で反映されます。Codex CLIの実行中プロセスやLM Studioへの進行中HTTPリクエストを強制終了しません。
+
+Windows GUIから実行するCodex CLI子プロセスにはコンソール非表示フラグを指定しています。判定ごとに黒い画面が表示される場合は、古いGUIプロセスが残っていないことを確認してGUIを再起動してください。
+
 ## `test-codex`
 
 Codex CLIの存在、バージョン、認証方式、設定モデルを確認します。モデル推論は実行しないため、この確認自体はPro利用枠を消費しません。
@@ -115,7 +129,7 @@ Import-Csv .\logs\latest_summary.csv | Select-Object -First 10
 Get-Content .\logs\app.log -Tail 50
 ```
 
-JSONL は 1 行 1 件の結果、CSV は一覧、`app.log` はアプリケーションログです。処理済みキャッシュを使う版では `cache/processed.json` もログと一緒に保全します。
+JSONLは1行1件の結果、CSVは一覧、`app.log`はアプリケーションログです。JSONL/CSVにはモデル判定、最終判定、判定源、ルール根拠も保存されます。処理済みキャッシュを使う版では`cache/processed.json`もログと一緒に保全します。
 
 ## 停止・再開
 

@@ -36,6 +36,7 @@ cache:
     assert config.output.directory == (tmp_path / "out").resolve()
     assert config.results_jsonl_path == (tmp_path / "state" / "logs" / "results.jsonl").resolve()
     assert config.processed_cache_path == (tmp_path / "state" / "cache" / "processed.json").resolve()
+    assert config.rules.mode == "standard"
 
 
 def test_ensure_directories_creates_only_application_directories(tmp_path: Path) -> None:
@@ -63,6 +64,7 @@ def test_ensure_directories_creates_only_application_directories(tmp_path: Path)
         "watch:\n  paths: [input]\nrules:\n  threshold_review: 0.9\n  threshold_pass: 0.5\n",
         "watch:\n  paths: [input]\nprocessing:\n  parallel_workers: 0\n",
         "watch:\n  paths: [input]\nrules:\n  fail_score_count: 0\n",
+        "watch:\n  paths: [input]\nrules:\n  mode: unknown\n",
         "watch:\n  paths: [output/incoming]\noutput:\n  directory: output\n",
     ],
 )

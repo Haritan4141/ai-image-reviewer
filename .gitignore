@@ -10,6 +10,7 @@ logs/*.jsonl
 logs/*.csv
 cache/*.json
 cache/codex-cli/
+cache/evaluation-*/
 output/pass/*
 output/review/*
 output/fail/*

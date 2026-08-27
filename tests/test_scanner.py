@@ -60,6 +60,10 @@ def test_scanner_processes_once_by_content_hash_and_persists_cache(tmp_path: Pat
 
     assert first is not None
     assert first.result == "PASS"
+    assert first.model_result == "PASS"
+    assert first.final_result == "PASS"
+    assert first.decision_source == "model"
+    assert first.review_mode == "standard"
     assert first.relative_path == "batch/one.png"
     assert duplicate is None
     assert classifier.calls == [image]
@@ -138,6 +142,7 @@ def test_scanner_does_not_consume_configured_output_tree(tmp_path: Path) -> None
         incoming,
         classifier,
         config={"output": {"directory": output}},
+        report_builder=False,
         stable_seconds=0,
         cache_path=tmp_path / "cache.json",
     )

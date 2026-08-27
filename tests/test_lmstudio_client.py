@@ -66,7 +66,12 @@ def test_image_to_data_url_encodes_bytes() -> None:
 
 def test_client_posts_multimodal_json_and_normalises_result() -> None:
     session = _Session([_envelope(_valid_payload())])
-    config = LMStudioClientConfig(retries=0, retry_delay_seconds=0, max_image_dimension=0)
+    config = LMStudioClientConfig(
+        retries=0,
+        retry_delay_seconds=0,
+        max_image_dimension=0,
+        review_mode="strict",
+    )
     client = LMStudioClient(config, session=session)
 
     result = client.classify_image(b"image bytes", image_name="sample.png")
@@ -77,6 +82,7 @@ def test_client_posts_multimodal_json_and_normalises_result() -> None:
     assert body["model"] == "qwen3-vl-8b"
     assert body["response_format"] == {"type": "json_object"}
     assert body["messages"][1]["content"][0]["type"] == "text"
+    assert "Inspection mode: STRICT" in body["messages"][1]["content"][0]["text"]
     image_item = body["messages"][1]["content"][1]
     assert image_item["type"] == "image_url"
     assert image_item["image_url"]["url"].startswith("data:image/png;base64,")

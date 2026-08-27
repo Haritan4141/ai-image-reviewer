@@ -18,6 +18,21 @@ def test_system_prompt_covers_strict_image_quality_checks_and_json_only_output()
         assert required in prompt
 
 
+def test_standard_prompt_accepts_intentional_stylization_and_requires_visible_fail_evidence() -> None:
+    prompt = build_system_prompt("standard").lower()
+
+    assert "intentional anatomical exaggeration" in prompt
+    assert "multiple people overlapping" in prompt
+    assert "not evidence" in prompt
+    assert "precise visible evidence" in prompt
+
+
+def test_review_mode_is_included_in_multimodal_messages() -> None:
+    messages = build_messages("data:image/png;base64,AAAA", mode="strict")
+
+    assert "inspection mode: strict" in str(messages).lower()
+
+
 def test_build_messages_keeps_local_paths_out_of_prompt() -> None:
     messages = build_messages("data:image/png;base64,AAAA", image_name=r"D:\private\batch\image.png")
     user_text = messages[1]["content"][0]["text"]

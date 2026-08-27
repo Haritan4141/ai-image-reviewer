@@ -30,7 +30,6 @@ DEFAULT_REVIEW_KEYWORDS: tuple[str, ...] = (
 
 DEFAULT_FAIL_KEYWORDS: tuple[str, ...] = (
     "severe deformation",
-    "major anatomy failure",
     "multiple extra limbs",
     "unrecognizable face",
     "heavy generation noise",
@@ -47,10 +46,11 @@ class LocalRulesConfig:
     data-only so they can be loaded from YAML and tuned without changing code.
     """
 
-    threshold_pass: float = 0.85
+    mode: str = "standard"
+    threshold_pass: float = 0.80
     threshold_review: float = 0.50
-    score_review_below: int = 6
-    score_fail_below: int = 3
+    score_review_below: int = 5
+    score_fail_below: int = 2
     fail_score_count: int = 2
     review_problem_keywords: tuple[str, ...] = DEFAULT_REVIEW_KEYWORDS
     fail_problem_keywords: tuple[str, ...] = DEFAULT_FAIL_KEYWORDS
@@ -78,6 +78,7 @@ class LocalRulesConfig:
             return tuple(str(item).strip() for item in raw if str(item).strip())
 
         return cls(
+            mode=str(value("mode", defaults.mode)).strip().lower(),
             threshold_pass=float(value("threshold_pass", defaults.threshold_pass)),
             threshold_review=float(value("threshold_review", defaults.threshold_review)),
             score_review_below=int(value("score_review_below", defaults.score_review_below)),
@@ -111,43 +112,76 @@ def apply_local_rules(
     analysis: ClassificationResult,
     rules: LocalRulesConfig | Mapping[str, Any] | object | None = None,
 ) -> ClassificationResult:
-    """Apply conservative local rules to a normalised VLM result.
-
-    The VLM's FAIL is never relaxed.  A VLM PASS is promoted to REVIEW for low
-    confidence, suspicious problem text, or low scores; severe configured
-    keywords and multiple very low scores promote it to FAIL.  This keeps the
-    automatic sorter biased toward human review instead of accidental loss.
-    """
+    """Apply the selected review profile and retain auditable decision evidence."""
 
     if not isinstance(analysis, ClassificationResult):
         analysis = ClassificationResult.from_mapping(analysis)
+    if analysis.local_rules_applied:
+        return analysis
     config = rules if isinstance(rules, LocalRulesConfig) else LocalRulesConfig.from_settings(rules)
 
-    model_result = analysis.result
+    mode = config.mode if config.mode in {"lenient", "standard", "strict"} else "standard"
+    model_result = analysis.model_result or analysis.result
     result = model_result
     fail_hits = _keyword_hits(analysis.problems, config.fail_problem_keywords)
     review_hits = _keyword_hits(analysis.problems, config.review_problem_keywords)
-    low_fail = _low_scores(analysis.scores, config.score_fail_below)
-    low_review = _low_scores(analysis.scores, config.score_review_below)
+    score_values = analysis.scores.to_dict()
+    low_fail = {name: score for name, score in score_values.items() if score < config.score_fail_below}
+    low_review = {name: score for name, score in score_values.items() if score < config.score_review_below}
+    corroborated_fail = bool(fail_hits) and len(low_fail) >= config.fail_score_count
+    decision_source = analysis.decision_source if analysis.decision_source == "validation" else "model"
+    reasons = list(analysis.rule_reasons)
 
-    # Explicit model FAIL and explicit severe local evidence always win.
-    if model_result is ResultLabel.FAIL:
+    if mode == "strict" and (
+        model_result is ResultLabel.FAIL
+        or fail_hits
+        or len(low_fail) >= config.fail_score_count
+    ):
         result = ResultLabel.FAIL
-    elif fail_hits or len(low_fail) >= config.fail_score_count:
+        if model_result is not ResultLabel.FAIL:
+            decision_source = "local_rules"
+            reasons.append("strict mode promoted the result to FAIL")
+    elif mode != "strict" and corroborated_fail:
         result = ResultLabel.FAIL
+        decision_source = "local_rules"
+        reasons.append("independent fail keyword and low-score evidence agreed")
+    elif model_result is ResultLabel.FAIL and mode != "strict":
+        result = ResultLabel.REVIEW
+        decision_source = "local_rules"
+        reasons.append(f"uncorroborated model FAIL downgraded to REVIEW in {mode} mode")
     elif model_result is ResultLabel.REVIEW:
         result = ResultLabel.REVIEW
     elif (
         analysis.confidence < config.threshold_pass
-        or analysis.confidence < config.threshold_review
         or review_hits
         or low_review
     ):
         result = ResultLabel.REVIEW
+        decision_source = "local_rules"
+        if analysis.confidence < config.threshold_pass:
+            reasons.append(
+                f"confidence {analysis.confidence:.2f} below PASS threshold {config.threshold_pass:.2f}"
+            )
+        if review_hits:
+            reasons.append("review keywords matched: " + ", ".join(review_hits))
+        if low_review:
+            reasons.append(
+                "review-level low scores: "
+                + ", ".join(f"{name}={score}" for name, score in low_review.items())
+            )
     else:
         result = ResultLabel.PASS
 
-    return analysis.copy_with(result=result)
+    return analysis.copy_with(
+        result=result,
+        model_result=model_result,
+        decision_source=decision_source,
+        low_scores={"review": low_review, "fail": low_fail},
+        keyword_hits={"review": review_hits, "fail": fail_hits},
+        rule_reasons=reasons,
+        review_mode=mode,
+        local_rules_applied=True,
+    )
 
 
 # A short alias is useful in tests and for future rule stages.
@@ -191,6 +225,11 @@ class ImageClassifier:
                 scores=ScoreSet(),
                 problems=[f"classifier error: {type(exc).__name__}"],
                 summary="The image could not be classified; manual review is required.",
+                model_result=None,
+                decision_source="fail_safe",
+                rule_reasons=[f"classifier error: {type(exc).__name__}"],
+                review_mode=self.rules.mode,
+                local_rules_applied=True,
             )
 
     classify_file = classify

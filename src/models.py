@@ -154,6 +154,13 @@ class ClassificationResult:
     problems: list[str] = field(default_factory=list)
     summary: str = ""
     raw: dict[str, Any] | None = field(default=None, repr=False)
+    model_result: ResultLabel | None = None
+    decision_source: str = "model"
+    low_scores: dict[str, dict[str, int]] = field(default_factory=dict)
+    keyword_hits: dict[str, list[str]] = field(default_factory=dict)
+    rule_reasons: list[str] = field(default_factory=list)
+    review_mode: str = "standard"
+    local_rules_applied: bool = False
 
     def __post_init__(self) -> None:
         self.result = ResultLabel.coerce(self.result)
@@ -166,6 +173,21 @@ class ClassificationResult:
             self.problems = list(self.problems) if isinstance(self.problems, Sequence) and not isinstance(self.problems, (str, bytes)) else []
         self.problems = [str(item).strip() for item in self.problems if str(item).strip()]
         self.summary = str(self.summary or "").strip()
+        if self.model_result is not None:
+            self.model_result = ResultLabel.coerce(self.model_result)
+        self.decision_source = str(self.decision_source or "model").strip()
+        self.low_scores = {
+            str(group): {str(name): int(score) for name, score in values.items()}
+            for group, values in self.low_scores.items()
+            if isinstance(values, Mapping)
+        }
+        self.keyword_hits = {
+            str(group): [str(item) for item in values]
+            for group, values in self.keyword_hits.items()
+            if isinstance(values, Sequence) and not isinstance(values, (str, bytes))
+        }
+        self.rule_reasons = [str(item).strip() for item in self.rule_reasons if str(item).strip()]
+        self.review_mode = str(self.review_mode or "standard").strip().lower()
 
     @classmethod
     def from_mapping(cls, value: object) -> "ClassificationResult":
@@ -192,7 +214,8 @@ class ClassificationResult:
         raw_result = value.get("result")
         result = ResultLabel.coerce(raw_result)
         normalized_result = raw_result.strip().upper().strip("`* _-.") if isinstance(raw_result, str) else ""
-        if normalized_result not in {item.value for item in ResultLabel}:
+        valid_model_result = normalized_result in {item.value for item in ResultLabel}
+        if not valid_model_result:
             validation_problems.append("invalid or missing result field")
             result = ResultLabel.REVIEW
         if "confidence" not in value:
@@ -231,6 +254,9 @@ class ClassificationResult:
             problems=problems,
             summary=str(value.get("summary", "") or ""),
             raw=raw,
+            model_result=ResultLabel.coerce(raw_result) if valid_model_result else None,
+            decision_source="validation" if validation_problems else "model",
+            rule_reasons=list(validation_problems),
         )
 
     # Common aliases used by callers that prefer a JSON-oriented name.
@@ -262,6 +288,13 @@ class ClassificationResult:
             "problems": list(self.problems),
             "summary": self.summary,
             "raw": self.raw,
+            "model_result": self.model_result,
+            "decision_source": self.decision_source,
+            "low_scores": {group: dict(values) for group, values in self.low_scores.items()},
+            "keyword_hits": {group: list(values) for group, values in self.keyword_hits.items()},
+            "rule_reasons": list(self.rule_reasons),
+            "review_mode": self.review_mode,
+            "local_rules_applied": self.local_rules_applied,
         }
         values.update(changes)
         return type(self)(**values)

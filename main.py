@@ -103,14 +103,17 @@ def _make_pipeline(
     client = _make_client(config)
     if config.classifier.backend == "codex_cli":
         logger.info(
-            "判定バックエンド: Codex CLI / model=%s / ChatGPT認証必須=%s",
+            "判定バックエンド: Codex CLI / model=%s / reasoning=%s / mode=%s / ChatGPT認証必須=%s",
             config.codex_cli.model,
+            config.codex_cli.reasoning_effort,
+            config.rules.mode,
             config.codex_cli.require_chatgpt_login,
         )
     else:
         logger.info(
-            "判定バックエンド: LM Studio / model=%s / url=%s",
+            "判定バックエンド: LM Studio / model=%s / mode=%s / url=%s",
             config.lmstudio.model,
+            config.rules.mode,
             config.lmstudio.base_url,
         )
     classifier = ImageClassifier(client, LocalRulesConfig.from_settings(config.rules))

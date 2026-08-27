@@ -11,6 +11,51 @@ import yaml
 
 
 SUPPORTED_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp")
+REVIEW_MODES = ("lenient", "standard", "strict")
+RULE_MODE_PRESETS: dict[str, dict[str, float | int]] = {
+    "lenient": {
+        "threshold_pass": 0.70,
+        "threshold_review": 0.40,
+        "score_review_below": 4,
+        "score_fail_below": 2,
+        "fail_score_count": 3,
+    },
+    "standard": {
+        "threshold_pass": 0.80,
+        "threshold_review": 0.50,
+        "score_review_below": 5,
+        "score_fail_below": 2,
+        "fail_score_count": 2,
+    },
+    "strict": {
+        "threshold_pass": 0.85,
+        "threshold_review": 0.50,
+        "score_review_below": 6,
+        "score_fail_below": 3,
+        "fail_score_count": 2,
+    },
+}
+RULE_MODE_FAIL_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "lenient": (
+        "severe deformation",
+        "multiple extra limbs",
+        "unrecognizable face",
+        "heavy generation noise",
+    ),
+    "standard": (
+        "severe deformation",
+        "multiple extra limbs",
+        "unrecognizable face",
+        "heavy generation noise",
+    ),
+    "strict": (
+        "severe deformation",
+        "major anatomy failure",
+        "multiple extra limbs",
+        "unrecognizable face",
+        "heavy generation noise",
+    ),
+}
 
 
 class ConfigError(ValueError):
@@ -51,10 +96,11 @@ class CodexCLIConfig:
 
 @dataclass(frozen=True, slots=True)
 class RulesConfig:
-    threshold_pass: float = 0.85
+    mode: str = "standard"
+    threshold_pass: float = 0.80
     threshold_review: float = 0.50
-    score_review_below: int = 6
-    score_fail_below: int = 3
+    score_review_below: int = 5
+    score_fail_below: int = 2
     fail_score_count: int = 2
     review_problem_keywords: tuple[str, ...] = (
         "extra finger",
@@ -69,7 +115,6 @@ class RulesConfig:
     )
     fail_problem_keywords: tuple[str, ...] = (
         "severe deformation",
-        "major anatomy failure",
         "multiple extra limbs",
         "unrecognizable face",
         "heavy generation noise",
@@ -259,10 +304,11 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
             ephemeral=bool(codex.get("ephemeral", True)),
         ),
         rules=RulesConfig(
-            threshold_pass=float(rules.get("threshold_pass", 0.85)),
+            mode=str(rules.get("mode", "standard")).strip().lower(),
+            threshold_pass=float(rules.get("threshold_pass", 0.80)),
             threshold_review=float(rules.get("threshold_review", 0.50)),
-            score_review_below=int(rules.get("score_review_below", 6)),
-            score_fail_below=int(rules.get("score_fail_below", 3)),
+            score_review_below=int(rules.get("score_review_below", 5)),
+            score_fail_below=int(rules.get("score_fail_below", 2)),
             fail_score_count=int(rules.get("fail_score_count", 2)),
             review_problem_keywords=_as_tuple(
                 rules.get("review_problem_keywords", list(RulesConfig().review_problem_keywords)),
@@ -323,6 +369,8 @@ def _validate(config: AppConfig) -> None:
         raise ConfigError("processing.parallel_workers must be at least 1")
     if config.rules.fail_score_count < 1:
         raise ConfigError("rules.fail_score_count must be at least 1")
+    if config.rules.mode not in REVIEW_MODES:
+        raise ConfigError("rules.mode must be 'lenient', 'standard', or 'strict'")
     if config.lmstudio.retries < 0:
         raise ConfigError("lmstudio.retries must not be negative")
     if config.codex_cli.retries < 0:

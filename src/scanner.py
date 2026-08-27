@@ -75,6 +75,13 @@ class ScanRecord:
     file_hash: str
     result: str
     confidence: float
+    model_result: str | None = None
+    final_result: str = ""
+    decision_source: str = "model"
+    review_mode: str = "standard"
+    low_scores: dict[str, dict[str, int]] = field(default_factory=dict)
+    keyword_hits: dict[str, list[str]] = field(default_factory=dict)
+    rule_reasons: list[str] = field(default_factory=list)
     scores: dict[str, int] = field(default_factory=dict)
     problems: list[str] = field(default_factory=list)
     summary: str = ""
@@ -330,12 +337,25 @@ class ImageScanner:
             except OSError:
                 pass
         scores = classification.scores.to_dict() if hasattr(classification.scores, "to_dict") else _as_dict(classification.scores)
+        final_result = classification.result.value if hasattr(classification.result, "value") else str(classification.result)
+        model_result = classification.model_result
         return ScanRecord(
             source_path=os.fspath(image),
             destination_path=os.fspath(destination) if destination is not None else None,
             file_hash=digest,
-            result=classification.result.value if hasattr(classification.result, "value") else str(classification.result),
+            result=final_result,
             confidence=float(classification.confidence),
+            model_result=(
+                model_result.value if hasattr(model_result, "value") else str(model_result)
+                if model_result is not None
+                else None
+            ),
+            final_result=final_result,
+            decision_source=classification.decision_source,
+            review_mode=classification.review_mode,
+            low_scores={group: dict(values) for group, values in classification.low_scores.items()},
+            keyword_hits={group: list(values) for group, values in classification.keyword_hits.items()},
+            rule_reasons=list(classification.rule_reasons),
             scores={str(k): int(v) for k, v in scores.items()},
             problems=list(classification.problems),
             summary=classification.summary,
@@ -420,7 +440,13 @@ class ImageScanner:
             record = self._record(
                 target,
                 digest,
-                ClassificationResult(result=ResultLabel.REVIEW, problems=[f"processing error: {type(exc).__name__}"]),
+                ClassificationResult(
+                    result=ResultLabel.REVIEW,
+                    problems=[f"processing error: {type(exc).__name__}"],
+                    decision_source="fail_safe",
+                    rule_reasons=[f"processing error: {type(exc).__name__}"],
+                    local_rules_applied=True,
+                ),
                 None,
                 None,
                 status="error",

@@ -46,6 +46,7 @@ class LMStudioClientConfig:
     jpeg_quality: int = 90
     max_tokens: int = 800
     temperature: float = 0.0
+    review_mode: str = "standard"
 
 
 class _Session(Protocol):
@@ -69,6 +70,11 @@ def config_from_settings(settings: object | None = None, **overrides: Any) -> LM
     """
 
     source = settings
+    rules = _setting(settings, "rules", None) if settings is not None else None
+    review_mode = overrides.get(
+        "review_mode",
+        _setting(rules, "mode", _setting(source, "review_mode", "standard")),
+    )
     if isinstance(source, (str, Path)) and "base_url" not in overrides:
         overrides = {"base_url": str(source), **overrides}
         source = None
@@ -106,6 +112,7 @@ def config_from_settings(settings: object | None = None, **overrides: Any) -> LM
         jpeg_quality=max(1, min(100, int(values["jpeg_quality"]))),
         max_tokens=max(1, int(values["max_tokens"])),
         temperature=max(0.0, float(values["temperature"])),
+        review_mode=str(review_mode).strip().lower(),
     )
 
 
@@ -323,7 +330,9 @@ class LMStudioClient:
             max_dimension=self.config.max_image_dimension,
             jpeg_quality=self.config.jpeg_quality,
         )
-        payload = self.request_json(build_messages(data_url, image_name=image_name))
+        payload = self.request_json(
+            build_messages(data_url, image_name=image_name, mode=self.config.review_mode)
+        )
         return ClassificationResult.from_mapping(payload)
 
     # ``analyze_image`` reads naturally in pipeline code and is kept as an

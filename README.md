@@ -10,6 +10,8 @@ Stable Diffusion WebUI や ComfyUI で大量生成した画像を、ChatGPT Pro�
 - `.png` / `.jpg` / `.jpeg` / `.webp`、サブフォルダ、ポーリング監視
 - ChatGPT Proの利用枠でGPT-5.6 Lunaを呼び出すCodex CLIバックエンド
 - LM StudioのOpenAI互換APIを使う完全ローカルバックエンド
+- WindowsデスクトップGUIからバックエンド、モデル、Lunaの推論設定、判定基準を切り替え
+- 入出力フォルダ選択、接続確認、進捗・結果・ログ表示、協調的な停止
 - VLM の JSON 判定に加えたローカル側の安全ルール
 - `output/pass`、`output/review`、`output/fail` へのコピーまたは移動
 - `logs/results.jsonl`、`logs/latest_summary.csv` への結果保存
@@ -64,6 +66,32 @@ python main.py watch
 ```
 
 コマンドのオプションと例は [docs/COMMANDS.md](docs/COMMANDS.md) を参照してください。
+
+## デスクトップGUI
+
+セットアップ後は、エクスプローラーで`start-gui.cmd`をダブルクリックするのが最も簡単です。PowerShellから起動する場合は次を実行します。
+
+```powershell
+python gui.py
+```
+
+GUIでは次の操作ができます。
+
+- ローカル／UNC入力フォルダの複数追加と出力先の選択
+- `Codex CLI / ChatGPT`と`LM Studio / ローカル`の切り替え
+- CodexモデルとGPT-5.6 Lunaの推論設定の選択
+- 判定基準を`緩め`／`標準（推奨）`／`厳格`から選択
+- LM Studio API URLの入力と、現在ロードされているモデル一覧の取得
+- バックエンド接続確認、一括スキャン、継続監視、停止
+- `copy` / `move`、再帰検索、処理済み画像の再判定
+- 進捗、PASS／REVIEW／FAIL／ERROR件数、結果一覧、ログの確認
+- 出力フォルダとHTMLレポートを開く
+
+GUIの設定はGit管理対象の`config.yaml`を上書きせず、`config.local.yaml`へ保存されます。Codex CLI選択時はChatGPT認証ガードが常に有効です。`move`は開始前に確認画面を表示します。停止は安全のため処理中の1枚を完了してから反映され、完了済みの結果とキャッシュは保持されます。
+
+WindowsではCodex CLIの子プロセスをコンソール非表示で起動するため、画像ごとの判定中に黒いコンソール画面が前面へ現れない構成です。更新前からGUIを開いたままの場合は、一度終了して`start-gui.cmd`から起動し直してください。
+
+GPT-5.6 Lunaの推論設定は`none`、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`、`ultra`から選択できます。大量処理は`low`、品質と速度のバランスは`medium`を開始点にしてください。公式仕様は[OpenAIのGPT-5.6 Lunaモデルページ](https://developers.openai.com/api/docs/models/gpt-5.6-luna)を参照してください。
 
 ## Codex CLIバックエンド（既定）
 
@@ -145,10 +173,11 @@ processing:
   extensions: [.png, .jpg, .jpeg, .webp]
 
 rules:
-  threshold_pass: 0.85
+  mode: standard                 # lenient / standard / strict
+  threshold_pass: 0.80
   threshold_review: 0.50
-  score_review_below: 6
-  score_fail_below: 3
+  score_review_below: 5
+  score_fail_below: 2
   fail_score_count: 2
   review_problem_keywords: [extra finger, missing finger, fused finger, deformed hand]
   fail_problem_keywords: [severe deformation, major anatomy failure]
@@ -174,7 +203,7 @@ report:
 
 ## 判定と安全策
 
-VLM には、手・指・顔・四肢・人体・余分なパーツ・融合・生成ノイズなどを厳しめに検査し、JSON のみ返すよう要求します。期待する結果の形は次のとおりです。
+VLMには、意図しない手・指・顔・四肢・人体・融合・生成ノイズを検査し、JSONのみ返すよう要求します。既定の`standard`では、アニメ調、意図的な誇張、遠近、トリミング、複数人物の重なり、装飾線やハイライトを、それ自体では欠陥にしません。期待する結果の形は次のとおりです。
 
 ```json
 {
@@ -194,7 +223,7 @@ VLM には、手・指・顔・四肢・人体・余分なパーツ・融合・�
 
 `result` は `PASS`、`REVIEW`、`FAIL` のいずれか、`confidence` は 0〜1、`scores` は 1〜10 の整数を想定します。JSON 以外の応答は補正・再試行の対象になります。JSON が欠落または不正な場合は、安全側に `REVIEW` として扱います。
 
-ローカルルールにより、VLM の `FAIL` は `FAIL` のまま、`REVIEW` は `REVIEW` のまま扱います。`PASS` でも信頼度が閾値未満、重大な問題語、低スコアがある場合は `REVIEW` 以上へ引き上げます。しきい値は `rules` で調整します。
+`standard`と`lenient`では、モデルが`FAIL`を返しただけでは最終FAILにしません。重大キーワードと複数の極低スコアが同時にそろった場合だけFAILを確定し、裏付けのないモデルFAILはREVIEWへ戻します。`strict`はモデルFAILを維持する従来に近い動作です。`results.jsonl`とCSVには`model_result`、`final_result`、`decision_source`、低スコア・キーワード・ルール根拠を保存します。
 
 ## UNC パスの注意
 

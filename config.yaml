@@ -52,10 +52,11 @@ processing:
   extensions: [.png, .jpg, .jpeg, .webp]
 
 rules:
-  threshold_pass: 0.85
+  mode: standard
+  threshold_pass: 0.80
   threshold_review: 0.50
-  score_review_below: 6
-  score_fail_below: 3
+  score_review_below: 5
+  score_fail_below: 2
   fail_score_count: 2
   review_problem_keywords:
     - extra finger
@@ -69,7 +70,6 @@ rules:
     - malformed anatomy
   fail_problem_keywords:
     - severe deformation
-    - major anatomy failure
     - multiple extra limbs
     - unrecognizable face
     - heavy generation noise

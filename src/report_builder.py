@@ -40,6 +40,13 @@ def _dict_record(value: object) -> dict[str, Any]:
             "destination_path",
             "file_hash",
             "result",
+            "model_result",
+            "final_result",
+            "decision_source",
+            "review_mode",
+            "low_scores",
+            "keyword_hits",
+            "rule_reasons",
             "confidence",
             "scores",
             "problems",
@@ -84,12 +91,19 @@ class ReportBuilder:
     CSV_FIELDS = (
         "processed_at",
         "result",
+        "model_result",
+        "final_result",
+        "decision_source",
+        "review_mode",
         "confidence",
         "source_path",
         "destination_path",
         "relative_path",
         "file_hash",
         "scores",
+        "low_scores",
+        "keyword_hits",
+        "rule_reasons",
         "problems",
         "summary",
         "status",
@@ -192,8 +206,12 @@ class ReportBuilder:
                     row["result"] = _label(row.get("result"))
                     row["confidence"] = self._confidence(row.get("confidence"))
                     row["scores"] = json.dumps(_json_normalize(row.get("scores", {})), ensure_ascii=False, separators=(",", ":"))
+                    row["low_scores"] = json.dumps(_json_normalize(row.get("low_scores", {})), ensure_ascii=False, separators=(",", ":"))
+                    row["keyword_hits"] = json.dumps(_json_normalize(row.get("keyword_hits", {})), ensure_ascii=False, separators=(",", ":"))
                     problems = row.get("problems", [])
                     row["problems"] = "; ".join(str(problem) for problem in problems) if isinstance(problems, (list, tuple)) else str(problems or "")
+                    reasons = row.get("rule_reasons", [])
+                    row["rule_reasons"] = "; ".join(str(reason) for reason in reasons) if isinstance(reasons, (list, tuple)) else str(reasons or "")
                     writer.writerow({field: row.get(field, "") for field in self.CSV_FIELDS})
             os.replace(os.fspath(temporary), os.fspath(self.csv_path))
         finally:
@@ -239,6 +257,14 @@ class ReportBuilder:
             else '<div class="missing">Thumbnail unavailable</div>'
         )
         summary = html.escape(str(record.get("summary") or ""))
+        model_result = html.escape(str(record.get("model_result") or "unknown"))
+        final_result = html.escape(str(record.get("final_result") or label))
+        decision_source = html.escape(str(record.get("decision_source") or "model"))
+        review_mode = html.escape(str(record.get("review_mode") or "standard"))
+        reasons = record.get("rule_reasons", [])
+        if not isinstance(reasons, (list, tuple)):
+            reasons = [reasons] if reasons else []
+        reasons_text = "<br>".join(html.escape(str(item)) for item in reasons) or "None"
         source_text = html.escape(source)
         timestamp = html.escape(_time_key(record))
         return (
@@ -246,7 +272,11 @@ class ReportBuilder:
             f'<div class="thumb">{image}</div>'
             f'<div class="meta"><span class="badge {label.lower()}">{label}</span>'
             f'<span class="confidence">confidence {confidence:.2f}</span></div>'
+            f'<div class="audit"><strong>Model</strong> {model_result} · '
+            f'<strong>Final</strong> {final_result} · <strong>Source</strong> {decision_source} · '
+            f'<strong>Mode</strong> {review_mode}</div>'
             f'<div class="problems"><strong>Problems</strong><br>{problems_text}</div>'
+            f'<div class="reasons"><strong>Decision reasons</strong><br>{reasons_text}</div>'
             f'<p class="summary">{summary}</p>'
             f'<details><summary>File</summary><code>{source_text}</code></details>'
             f'<time datetime="{timestamp}">{timestamp}</time>'
@@ -273,7 +303,7 @@ button.active {{ outline:2px solid #72a7ff; }} #grid {{ display:grid; grid-templ
 .thumb img {{ display:block; max-width:100%; height:auto; object-fit:contain; }} .thumb img.missing,.missing {{ color:#f5b8b8; padding:20px; }}
 .meta {{ display:flex; justify-content:space-between; align-items:center; margin:10px 0; }} .badge {{ border-radius:999px; padding:3px 9px; font-weight:700; }}
 .pass {{ background:#1c7845; color:#d5ffe7; }} .review {{ background:#89691b; color:#fff5cf; }} .fail {{ background:#932d3b; color:#ffe2e5; }}
-.confidence {{ color:var(--muted); }} .problems {{ min-height:40px; }} .summary {{ color:var(--muted); }} details {{ margin-top:8px; }} code {{ display:block; white-space:pre-wrap; overflow-wrap:anywhere; color:var(--muted); }} time {{ display:block; color:var(--muted); font-size:12px; margin-top:9px; }}
+.confidence {{ color:var(--muted); }} .audit,.reasons {{ color:var(--muted); margin:7px 0; }} .problems {{ min-height:40px; }} .summary {{ color:var(--muted); }} details {{ margin-top:8px; }} code {{ display:block; white-space:pre-wrap; overflow-wrap:anywhere; color:var(--muted); }} time {{ display:block; color:var(--muted); font-size:12px; margin-top:9px; }}
 </style></head><body>
 <h1>AI Image Review</h1><div class="updated">{len(values)} images · generated {html.escape(generated)}</div>
 <div class="toolbar" role="toolbar" aria-label="Filter results"><button class="active" data-filter="ALL">All</button><button data-filter="PASS">PASS</button><button data-filter="REVIEW">REVIEW</button><button data-filter="FAIL">FAIL</button></div>
