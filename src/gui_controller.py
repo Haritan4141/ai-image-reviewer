@@ -16,6 +16,7 @@ from .codex_cli_client import CodexCLIClient
 from .config import (
     AppConfig,
     ConfigError,
+    CROP_MODES,
     REVIEW_MODES,
     RULE_MODE_FAIL_KEYWORDS,
     RULE_MODE_PRESETS,
@@ -42,6 +43,16 @@ REVIEW_MODE_DESCRIPTIONS = {
     "standard": "アニメ調・誇張・遠近・重なりを許容し、根拠がそろった場合だけFAILにします。",
     "strict": "小さな手指や輪郭まで厳しく確認し、従来に近い基準で判定します。",
 }
+CROP_MODE_LABELS = {
+    "fast": "Fast",
+    "balanced": "Balanced（推奨）",
+    "strict": "Strict",
+}
+CROP_MODE_DESCRIPTIONS = {
+    "fast": "追加確認を最小限にし、処理時間と推論回数を抑えます。",
+    "balanced": "人物らしい画像では顔・手を優先し、必要な場合だけ足も再確認します。",
+    "strict": "人物らしい画像の顔・手・足を広く再確認し、見逃しを最小化します。",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +65,9 @@ class DesktopSettings:
     codex_model: str = "gpt-5.6-luna"
     reasoning_effort: str = "low"
     review_mode: str = "standard"
+    crop_recheck_enabled: bool = False
+    crop_mode: str = "balanced"
+    keep_crop_files: bool = True
     lmstudio_url: str = "http://127.0.0.1:1234/v1"
     lmstudio_model: str = "qwen3-vl-8b"
     operation: str = "copy"
@@ -121,6 +135,12 @@ def validate_desktop_settings(settings: DesktopSettings) -> None:
         raise ConfigError("GPT-5.6 Lunaの推論設定を選択してください")
     if settings.review_mode not in REVIEW_MODES:
         raise ConfigError("判定基準は緩め、標準、厳格から選択してください")
+    if not isinstance(settings.crop_recheck_enabled, bool):
+        raise ConfigError("クロップ再判定の有効設定はtrueまたはfalseにしてください")
+    if settings.crop_mode not in CROP_MODES:
+        raise ConfigError("クロップ再判定モードはFast、Balanced、Strictから選択してください")
+    if not isinstance(settings.keep_crop_files, bool):
+        raise ConfigError("クロップファイル保持設定はtrueまたはfalseにしてください")
     if not settings.lmstudio_url.strip().lower().startswith(("http://", "https://")):
         raise ConfigError("LM Studio URLはhttp://またはhttps://から入力してください")
     if not settings.lmstudio_model.strip():
@@ -157,6 +177,9 @@ class ConfigStore:
             codex_model=config.codex_cli.model,
             reasoning_effort=config.codex_cli.reasoning_effort,
             review_mode=config.rules.mode,
+            crop_recheck_enabled=config.crop_recheck.enabled,
+            crop_mode=config.crop_recheck.mode,
+            keep_crop_files=config.crop_recheck.keep_crop_files,
             lmstudio_url=config.lmstudio.base_url,
             lmstudio_model=config.lmstudio.model,
             operation=config.output.operation,
@@ -209,6 +232,11 @@ class ConfigStore:
         if previous_mode != settings.review_mode:
             rules.update(RULE_MODE_PRESETS[settings.review_mode])
             rules["fail_problem_keywords"] = list(RULE_MODE_FAIL_KEYWORDS[settings.review_mode])
+
+        crop_recheck = self._section(raw, "crop_recheck")
+        crop_recheck["enabled"] = settings.crop_recheck_enabled
+        crop_recheck["mode"] = settings.crop_mode
+        crop_recheck["keep_crop_files"] = settings.keep_crop_files
 
         lmstudio = self._section(raw, "lmstudio")
         lmstudio["base_url"] = settings.lmstudio_url.strip().rstrip("/")
@@ -288,7 +316,7 @@ class ReviewEngine:
             return self._running
 
     def stop(self) -> None:
-        """Request cooperative stop; an active image finishes first."""
+        """Request cooperative stop after the active request, between crops."""
 
         self._stop_event.set()
 
@@ -320,8 +348,20 @@ class ReviewEngine:
                 self.config.lmstudio.model,
                 self.config.lmstudio.base_url,
             )
-        classifier = ImageClassifier(client, LocalRulesConfig.from_settings(self.config.rules))
+        classifier = ImageClassifier(
+            client,
+            LocalRulesConfig.from_settings(self.config.rules),
+            crop_config=self.config.crop_recheck,
+            stop_requested=self._stop_event.is_set,
+            logger=self.logger,
+        )
         self.logger.info("判定基準: %s", self.config.rules.mode)
+        self.logger.info(
+            "クロップ再判定: enabled=%s / mode=%s / keep_crop_files=%s",
+            self.config.crop_recheck.enabled,
+            self.config.crop_recheck.mode,
+            self.config.crop_recheck.keep_crop_files,
+        )
         sorter = ImageSorter(config=self.config, source_roots=roots)
         report = ReportBuilder(config=self.config)
         scanner = ImageScanner(
@@ -353,6 +393,7 @@ class ReviewEngine:
                 extensions=self.config.processing.extensions,
             )
             if not scanner._is_output_path(path)
+            and not getattr(scanner, "_is_excluded_path", lambda _: False)(path)
         ]
 
     def run(
@@ -468,6 +509,8 @@ class ReviewEngine:
 
 __all__ = [
     "BACKENDS",
+    "CROP_MODE_DESCRIPTIONS",
+    "CROP_MODE_LABELS",
     "OPERATIONS",
     "REASONING_EFFORTS",
     "REVIEW_MODE_DESCRIPTIONS",

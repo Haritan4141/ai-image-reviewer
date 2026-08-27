@@ -12,6 +12,7 @@ from src.codex_cli_client import (
     CodexCLIAuthError,
     CodexCLIClient,
     CodexCLIClientConfig,
+    LOCALIZATION_OUTPUT_SCHEMA,
 )
 from src.models import ResultLabel
 
@@ -32,10 +33,30 @@ def _payload() -> dict[str, object]:
     }
 
 
+def _localization_payload() -> dict[str, object]:
+    return {
+        "person_present": True,
+        "confidence": 0.94,
+        "regions": [
+            {"kind": "face", "box": [0.2, 0.1, 0.5, 0.4], "confidence": 0.92},
+            {"kind": "hand", "box": [0.1, 0.5, 0.25, 0.75], "confidence": 0.87},
+        ],
+        "not_visible": ["foot"],
+        "summary": "visible face and hand",
+    }
+
+
 class _Runner:
-    def __init__(self, *, login: str = "Logged in using ChatGPT", malformed_first: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        login: str = "Logged in using ChatGPT",
+        malformed_first: bool = False,
+        localization: bool = False,
+    ) -> None:
         self.login = login
         self.malformed_first = malformed_first
+        self.localization = localization
         self.calls: list[tuple[list[str], dict[str, Any]]] = []
         self.schemas: list[dict[str, Any]] = []
         self.image_sizes: list[tuple[int, int]] = []
@@ -64,7 +85,8 @@ class _Runner:
         if self.malformed_first and self.exec_count == 1:
             output_path.write_text("not json", encoding="utf-8")
         else:
-            output_path.write_text(json.dumps(_payload()), encoding="utf-8")
+            payload = _localization_payload() if self.localization else _payload()
+            output_path.write_text(json.dumps(payload), encoding="utf-8")
         return subprocess.CompletedProcess(command, 0, "", "")
 
 
@@ -180,3 +202,77 @@ def test_oversized_image_is_downscaled_without_changing_source(tmp_path: Path) -
     assert runner.image_sizes == [(256, 128)]
     with Image.open(image) as original:
         assert original.size == (512, 256)
+
+
+def test_target_crop_uses_same_classification_schema_and_target_prompt(tmp_path: Path) -> None:
+    image = tmp_path / "sample.png"
+    image.write_bytes(b"fake image content")
+    runner = _Runner()
+    client = CodexCLIClient(_config(tmp_path), runner=runner, executable_path="codex-test")
+
+    result = client.classify_image(image, target="hand", region_index=1)
+
+    assert result.result is ResultLabel.PASS
+    exec_args, kwargs = next(call for call in runner.calls if call[0][1] == "exec")
+    assert "HAND CROP" in kwargs["input"]
+    assert "only the visible hand" in kwargs["input"].lower()
+    assert "neutral score 10" in kwargs["input"]
+    assert set(runner.schemas[0]["required"]) == {
+        "result",
+        "confidence",
+        "scores",
+        "problems",
+        "summary",
+    }
+
+
+def test_localize_regions_uses_separate_schema_and_preserves_absence_contract(tmp_path: Path) -> None:
+    image = tmp_path / "sample.png"
+    image.write_bytes(b"fake image content")
+    runner = _Runner(localization=True)
+    client = CodexCLIClient(_config(tmp_path), runner=runner, executable_path="codex-test")
+
+    result = client.locate_regions(image)
+
+    assert result["person_present"] is True
+    assert result["not_visible"] == ["foot"]
+    assert result["regions"][1]["kind"] == "hand"
+    assert runner.schemas[0] == LOCALIZATION_OUTPUT_SCHEMA
+    exec_args, kwargs = next(call for call in runner.calls if call[0][1] == "exec")
+    assert "localize visible" in kwargs["input"].lower()
+    assert "person_present" in kwargs["input"]
+    assert '"scores"' not in kwargs["input"]
+
+
+def test_localize_regions_model_failure_returns_unknown_not_absence(tmp_path: Path) -> None:
+    image = tmp_path / "sample.png"
+    image.write_bytes(b"fake image content")
+    runner = _Runner(malformed_first=True)
+    client = CodexCLIClient(_config(tmp_path), runner=runner, executable_path="codex-test")
+
+    result = client.locate_regions(image)
+
+    assert result["person_present"] is None
+    assert result["regions"] == []
+    assert result["not_visible"] == []
+
+
+def test_small_exif_rotated_image_is_transposed_without_changing_source(tmp_path: Path) -> None:
+    from PIL import Image
+
+    image = tmp_path / "rotated.jpg"
+    original = Image.new("RGB", (2, 3), color=(10, 20, 30))
+    exif = original.getexif()
+    exif[274] = 6
+    original.save(image, format="JPEG", exif=exif)
+    source_bytes = image.read_bytes()
+    runner = _Runner()
+    client = CodexCLIClient(_config(tmp_path, max_image_dimension=0), runner=runner, executable_path="codex-test")
+
+    client.classify_image(image)
+
+    assert runner.image_sizes == [(3, 2)]
+    with Image.open(image) as source:
+        assert source.size == (2, 3)
+        assert source.getexif().get(274) == 6
+    assert image.read_bytes() == source_bytes

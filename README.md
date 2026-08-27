@@ -18,6 +18,8 @@ Stable Diffusion WebUI や ComfyUI で大量生成した画像を、ChatGPT Pro�
 - サムネイル付き静的 `review.html`（結果・信頼度・問題点を表示、結果で絞り込み）
 - `review`だけの再判定、各バックエンドの接続テスト、レポート再生成
 - 処理済み判定による重複処理の抑止
+- 顔・複数の手・条件付きの足を拡大するクロップ再判定（Fast / Balanced / Strict）
+- クロップごとの判定根拠・検出信頼度・サムネイルをJSONL / CSV / HTMLに保存
 
 ## 動作要件
 
@@ -81,6 +83,7 @@ GUIでは次の操作ができます。
 - `Codex CLI / ChatGPT`と`LM Studio / ローカル`の切り替え
 - CodexモデルとGPT-5.6 Lunaの推論設定の選択
 - 判定基準を`緩め`／`標準（推奨）`／`厳格`から選択
+- 全体判定とは独立したクロップ再判定の有効化、Fast / Balanced（推奨） / Strict、クロップ保持の選択
 - LM Studio API URLの入力と、現在ロードされているモデル一覧の取得
 - バックエンド接続確認、一括スキャン、継続監視、停止
 - `copy` / `move`、再帰検索、処理済み画像の再判定
@@ -225,6 +228,40 @@ VLMには、意図しない手・指・顔・四肢・人体・融合・生成�
 
 `standard`と`lenient`では、モデルが`FAIL`を返しただけでは最終FAILにしません。重大キーワードと複数の極低スコアが同時にそろった場合だけFAILを確定し、裏付けのないモデルFAILはREVIEWへ戻します。`strict`はモデルFAILを維持する従来に近い動作です。`results.jsonl`とCSVには`model_result`、`final_result`、`decision_source`、低スコア・キーワード・ルール根拠を保存します。
 
+## 顔・手・足のクロップ再判定
+
+全体画像で小さく見える顔や指などの**見逃しを減らす**ため、全体判定後に部位を切り出し、部位専用プロンプトで追加確認します。LM StudioのローカルVLMとCodex CLI / GPT-5.6 Lunaの両方で同じ処理を使います。クロップがPASSでも、全体のREVIEWをPASSへ戻しません。
+
+既存設定の動作を維持するため、設定を省略した場合と配布用`config.yaml`では**無効**です。常用には**Balancedを推奨**します。GUIの「追加確認（クロップ再判定）」を有効にするか、使用中の設定ファイルへ以下を追加します。
+
+```yaml
+crop_recheck:
+  enabled: true
+  mode: balanced
+  keep_crop_files: true
+  crop_cache_dir: cache/crops
+  detectors:
+    provider: auto
+    allow_fallback: true
+    detector_failure_policy: review
+```
+
+| モード | 実際の追加確認 |
+|---|---|
+| Fast | 高信頼の全体PASSは原則省略。REVIEW、低信頼、低スコア、部位問題語、要約中の小さい顔・手の記述で実行 |
+| Balanced（推奨） | 人物が見える画像で顔と手を原則確認。足はanatomy低スコア、足の問題語、検出領域が大きい場合に追加 |
+| Strict | 人物が見える画像で顔・手・足を原則確認。必要部位が未検出・不確実ならREVIEW |
+
+これらは確認量の設定です。従来の`rules.mode`（緩め／標準／厳格）は判定の厳しさの設定で、別々に指定できます。全体判定で既に確定したFAILは、どのクロップモードでも追加確認を省略して維持します。
+
+初期実装の`auto` / `vlm`は**選択中のVLMによる座標検出**です。別の検出器モデルや追加依存のインストールは不要ですが、座標・信頼度は近似であり、検出精度の保証はありません。`none`や利用不能時もアプリは動き、追加確認が必要な画像をREVIEWにします。画面外や遮蔽で「見えない」と高信頼で判定された部位は欠損と扱わず、未知・検出失敗と区別します。毎回固定の6分割や、検出失敗時の推測グリッドは使用しません。
+
+有効時は、対象画像ごとに全体判定1回＋座標検出1回＋選択されたクロップ数の推論が必要です。既定上限は顔2・手4・足4で、最大12回（再試行を除く）。時間とCodex利用枠の消費は増えます。上限超過、低信頼、最小サイズ未満、JSON不正、途中停止は未確認の根拠としてREVIEWへ残します。
+
+`review.html`にはFull／Final、モードと統合バージョン、`[Hand 0] REVIEW`などの原因と保持したクロップのサムネイルを表示します。`keep_crop_files: false`なら、この実行で作った一時クロップだけを処理後に削除し、座標・判定はログに残します。元画像と既存のクロップ履歴は削除しません。保持するクロップは容量と画像の機密性に注意し、HTMLだけでなく画像と一緒に管理してください。
+
+既に処理済みの画像は従来どおりハッシュでスキップします。設定変更後の再評価にはGUIの「処理済み画像の再判定」または`scan --force`を使用してください。詳細な設定・構造・制約は[クロップ再判定の実装設計](docs/CROP_RECHECK_DESIGN.md)を参照してください。
+
 ## UNC パスの注意
 
 - 検品を実行する Windows ユーザーが、対象共有の読み取り権限と、仕分け先の書き込み権限を持つことを確認してください。
@@ -297,6 +334,7 @@ logs/
   app.log
 cache/
   processed.json
+  crops/                     # 保持を有効にしたクロップ（Git対象外）
 review.html
 ```
 
@@ -311,4 +349,4 @@ python -m pytest -q
 
 自動テストはCodex、LM Studio、実ファイル共有へ接続せず、設定検証・認証ガード・コマンド組み立て・JSON正規化・仕分け・レポートを確認します。実バックエンドの確認は`test-codex`または`test-lmstudio`と、少数画像の手動スキャンで行ってください。
 
-顔・手などのクロップ再判定の方針は [docs/CROP_RECHECK_DESIGN.md](docs/CROP_RECHECK_DESIGN.md)、優先順位は [docs/ROADMAP.md](docs/ROADMAP.md) を参照してください。
+顔・手・足のクロップ再判定の実装仕様は [docs/CROP_RECHECK_DESIGN.md](docs/CROP_RECHECK_DESIGN.md)、優先順位は [docs/ROADMAP.md](docs/ROADMAP.md) を参照してください。

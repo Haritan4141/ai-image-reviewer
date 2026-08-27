@@ -14,6 +14,8 @@ import webbrowser
 
 from .config import ConfigError
 from .gui_controller import (
+    CROP_MODE_DESCRIPTIONS,
+    CROP_MODE_LABELS,
     REASONING_EFFORTS,
     REVIEW_MODE_DESCRIPTIONS,
     REVIEW_MODE_LABELS,
@@ -102,6 +104,10 @@ class DesktopApp:
         self.reasoning_var = tk.StringVar(value="low")
         self.review_mode_var = tk.StringVar(value=REVIEW_MODE_LABELS["standard"])
         self.review_mode_help_var = tk.StringVar(value=REVIEW_MODE_DESCRIPTIONS["standard"])
+        self.crop_recheck_enabled_var = tk.BooleanVar(value=False)
+        self.crop_mode_var = tk.StringVar(value=CROP_MODE_LABELS["balanced"])
+        self.crop_mode_help_var = tk.StringVar(value=CROP_MODE_DESCRIPTIONS["balanced"])
+        self.keep_crop_files_var = tk.BooleanVar(value=True)
         self.lmstudio_url_var = tk.StringVar(value="http://127.0.0.1:1234/v1")
         self.lmstudio_model_var = tk.StringVar(value="qwen3-vl-8b")
         self.output_var = tk.StringVar(value=os.fspath(PROJECT_ROOT / "output"))
@@ -264,6 +270,36 @@ class DesktopApp:
             wraplength=500,
         ).grid(row=2, column=0, sticky="w", pady=(7, 0))
 
+        crop_frame = ttk.LabelFrame(backend_frame, text="追加確認（クロップ再判定）", padding=7)
+        crop_frame.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        crop_frame.columnconfigure(2, weight=1)
+        ttk.Checkbutton(
+            crop_frame,
+            text="クロップ再判定を有効にする",
+            variable=self.crop_recheck_enabled_var,
+        ).grid(row=0, column=0, columnspan=3, sticky="w")
+        ttk.Label(crop_frame, text="確認モード:").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        crop_mode_combo = ttk.Combobox(
+            crop_frame,
+            textvariable=self.crop_mode_var,
+            values=tuple(CROP_MODE_LABELS.values()),
+            state="readonly",
+            width=17,
+        )
+        crop_mode_combo.grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(6, 0))
+        crop_mode_combo.bind("<<ComboboxSelected>>", self._on_crop_mode_changed)
+        ttk.Checkbutton(
+            crop_frame,
+            text="クロップ画像を保持",
+            variable=self.keep_crop_files_var,
+        ).grid(row=1, column=2, sticky="w", padx=(12, 0), pady=(6, 0))
+        ttk.Label(
+            crop_frame,
+            textvariable=self.crop_mode_help_var,
+            style="Subheader.TLabel",
+            wraplength=500,
+        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
         actions = ttk.Frame(outer)
         actions.pack(fill=tk.X, pady=(12, 8))
         self.save_button = ttk.Button(actions, text="設定を保存", command=self._save_settings)
@@ -365,6 +401,10 @@ class DesktopApp:
         self.reasoning_var.set(settings.reasoning_effort)
         self.review_mode_var.set(REVIEW_MODE_LABELS[settings.review_mode])
         self.review_mode_help_var.set(REVIEW_MODE_DESCRIPTIONS[settings.review_mode])
+        self.crop_recheck_enabled_var.set(settings.crop_recheck_enabled)
+        self.crop_mode_var.set(CROP_MODE_LABELS[settings.crop_mode])
+        self.crop_mode_help_var.set(CROP_MODE_DESCRIPTIONS[settings.crop_mode])
+        self.keep_crop_files_var.set(settings.keep_crop_files)
         self.lmstudio_url_var.set(settings.lmstudio_url)
         self.lmstudio_model_var.set(settings.lmstudio_model)
         self.operation_var.set(settings.operation)
@@ -388,6 +428,13 @@ class DesktopApp:
             "standard",
         )
         self.review_mode_help_var.set(REVIEW_MODE_DESCRIPTIONS[mode])
+
+    def _on_crop_mode_changed(self, _event: object | None = None) -> None:
+        mode = next(
+            (key for key, label in CROP_MODE_LABELS.items() if label == self.crop_mode_var.get()),
+            "balanced",
+        )
+        self.crop_mode_help_var.set(CROP_MODE_DESCRIPTIONS[mode])
 
     def _browse_input(self) -> None:
         selected = filedialog.askdirectory(parent=self.root, title="入力フォルダを選択")
@@ -421,6 +468,10 @@ class DesktopApp:
             (key for key, label in REVIEW_MODE_LABELS.items() if label == self.review_mode_var.get()),
             "standard",
         )
+        crop_mode = next(
+            (key for key, label in CROP_MODE_LABELS.items() if label == self.crop_mode_var.get()),
+            "balanced",
+        )
         return DesktopSettings(
             input_paths=paths,
             output_path=Path(self.output_var.get().strip().strip('"')),
@@ -428,6 +479,9 @@ class DesktopApp:
             codex_model=self.codex_model_var.get(),
             reasoning_effort=self.reasoning_var.get(),
             review_mode=review_mode,
+            crop_recheck_enabled=self.crop_recheck_enabled_var.get(),
+            crop_mode=crop_mode,
+            keep_crop_files=self.keep_crop_files_var.get(),
             lmstudio_url=self.lmstudio_url_var.get(),
             lmstudio_model=self.lmstudio_model_var.get(),
             operation=self.operation_var.get(),
@@ -544,7 +598,7 @@ class DesktopApp:
             return
         self.engine.stop()
         if self.session_logger is not None:
-            self.session_logger.info("停止要求を受け付けました。処理中の画像完了後に停止します")
+            self.session_logger.info("停止要求を受け付けました。現在の判定要求が完了次第、残りの処理を停止します")
         self.stop_button.configure(state=tk.DISABLED)
         self.status_var.set("停止要求済み")
         self.progress_text_var.set("現在の画像の判定終了後に停止します")

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import logging
 from pathlib import Path
-from typing import Any, Mapping, Protocol, Sequence
+from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from .models import ClassificationResult, ResultLabel, ScoreSet
 
@@ -122,7 +123,7 @@ def apply_local_rules(
 
     mode = config.mode if config.mode in {"lenient", "standard", "strict"} else "standard"
     model_result = analysis.model_result or analysis.result
-    result = model_result
+    result = analysis.result
     fail_hits = _keyword_hits(analysis.problems, config.fail_problem_keywords)
     review_hits = _keyword_hits(analysis.problems, config.review_problem_keywords)
     score_values = analysis.scores.to_dict()
@@ -132,7 +133,12 @@ def apply_local_rules(
     decision_source = analysis.decision_source if analysis.decision_source == "validation" else "model"
     reasons = list(analysis.rule_reasons)
 
-    if mode == "strict" and (
+    if analysis.decision_source == "validation":
+        result = ResultLabel.REVIEW
+    elif analysis.pipeline_version and analysis.result is ResultLabel.FAIL:
+        # Re-normalizing a stored merged verdict must not erase crop evidence.
+        result = ResultLabel.FAIL
+    elif mode == "strict" and (
         model_result is ResultLabel.FAIL
         or fail_hits
         or len(low_fail) >= config.fail_score_count
@@ -149,7 +155,7 @@ def apply_local_rules(
         result = ResultLabel.REVIEW
         decision_source = "local_rules"
         reasons.append(f"uncorroborated model FAIL downgraded to REVIEW in {mode} mode")
-    elif model_result is ResultLabel.REVIEW:
+    elif analysis.result is ResultLabel.REVIEW or model_result is ResultLabel.REVIEW:
         result = ResultLabel.REVIEW
     elif (
         analysis.confidence < config.threshold_pass
@@ -189,7 +195,8 @@ apply_rules = apply_local_rules
 
 
 class ImageAnalysisClient(Protocol):
-    def classify_image(self, image: str | Path, *, image_name: str | None = None) -> ClassificationResult: ...
+    def classify_image(self, image: str | Path, *, image_name: str | None = None,
+                       target: str = "full", region_index: int | None = None) -> ClassificationResult: ...
 
 
 @dataclass(slots=True)
@@ -199,6 +206,10 @@ class ImageClassifier:
     client: ImageAnalysisClient
     rules: LocalRulesConfig = field(default_factory=LocalRulesConfig)
     fail_safe: bool = True
+    crop_config: object | None = None
+    detector: object | None = None
+    stop_requested: Callable[[], bool] | None = None
+    logger: logging.Logger | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.rules, LocalRulesConfig):
@@ -215,11 +226,11 @@ class ImageClassifier:
         path = Path(image)
         try:
             raw = self.client.classify_image(path, image_name=image_name or path.name)
-            return apply_local_rules(raw, self.rules)
+            full = apply_local_rules(raw, self.rules)
         except Exception as exc:
             if not self.fail_safe:
                 raise
-            return ClassificationResult(
+            full = ClassificationResult(
                 result=ResultLabel.REVIEW,
                 confidence=0.0,
                 scores=ScoreSet(),
@@ -231,6 +242,14 @@ class ImageClassifier:
                 review_mode=self.rules.mode,
                 local_rules_applied=True,
             )
+        if self.crop_config is not None and getattr(self.crop_config, "enabled", False):
+            from .crop_pipeline import CropRecheckPipeline
+
+            return CropRecheckPipeline(
+                self.client, self.crop_config, self.rules,
+                detector=self.detector, stop_requested=self.stop_requested, logger=self.logger,
+            ).inspect(path, full)
+        return full
 
     classify_file = classify
 

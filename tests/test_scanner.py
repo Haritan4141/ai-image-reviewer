@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 from src.scanner import ImageScanner, normalize_classification, scan_images
 from src.models import ResultLabel
@@ -170,3 +171,89 @@ def test_move_mode_preserves_source_metadata_in_record(tmp_path: Path) -> None:
     assert record.modified_at is not None
     assert not image.exists()
     assert Path(record.destination_path or "").is_file()
+
+
+def test_scanner_retains_crop_checks_and_pipeline_metadata_without_raw_payload(tmp_path: Path) -> None:
+    image = tmp_path / "one.png"
+    image.write_bytes(b"image")
+    scanner = ImageScanner(image.parent, _Classifier(), stable_seconds=0)
+    classification = SimpleNamespace(
+        result=ResultLabel.REVIEW,
+        model_result=ResultLabel.PASS,
+        confidence=0.72,
+        scores={"hands": 8},
+        problems=["hand requires review"],
+        summary="full result",
+        decision_source="crop_merge",
+        review_mode="balanced",
+        low_scores={},
+        keyword_hits={},
+        rule_reasons=["crop review"],
+        pipeline_stage="full_plus_crop",
+        pipeline_version="crop-v1",
+        crop_mode="balanced",
+        full_result_before_merge="PASS",
+        crop_checks=[
+            {
+                "kind": "hand",
+                "index": 0,
+                "box": {"x1": 0.1, "y1": 0.2, "x2": 0.8, "y2": 0.9},
+                "result": "REVIEW",
+                "confidence": 0.4,
+                "problems": ["finger ambiguity"],
+                "summary": "needs review",
+                "detector_name": "fallback",
+                "detector_confidence": 0.5,
+                "raw": {"secret": "must not be persisted"},
+            }
+        ],
+    )
+
+    record = scanner._record(image, "digest", classification, None, "one.png")
+
+    assert record.result == "REVIEW"
+    assert record.model_result == "PASS"
+    assert record.pipeline_stage == "full_plus_crop"
+    assert record.pipeline_version == "crop-v1"
+    assert record.crop_mode == "balanced"
+    assert record.full_result_before_merge == "PASS"
+    assert record.crop_checks[0]["kind"] == "hand"
+    assert record.crop_checks[0]["box"] == [0.1, 0.2, 0.8, 0.9]
+    assert "raw" not in record.crop_checks[0]
+
+
+def test_scanner_excludes_crop_cache_even_when_crop_recheck_is_disabled(tmp_path: Path) -> None:
+    incoming = tmp_path / "incoming"
+    crop_cache = incoming / "cache" / "crops"
+    crop_cache.mkdir(parents=True)
+    good = incoming / "good.png"
+    generated = crop_cache / "generated.png"
+    good.write_bytes(b"good")
+    generated.write_bytes(b"generated")
+    classifier = _Classifier()
+    scanner = ImageScanner(
+        incoming,
+        classifier,
+        config={"crop_recheck": {"crop_cache_dir": crop_cache}},
+        report_builder=False,
+        stable_seconds=0,
+        cache_path=tmp_path / "processed.json",
+    )
+
+    records = scanner.scan()
+
+    assert [Path(record.source_path).name for record in records] == ["good.png"]
+    assert classifier.calls == [good]
+    assert scanner.process_file(generated) is None
+
+
+def test_explicit_crop_cache_input_cannot_feed_crops_back_into_pipeline(tmp_path: Path) -> None:
+    crops = tmp_path / "crops"
+    crops.mkdir()
+    generated = crops / "hand.png"
+    generated.write_bytes(b"generated")
+    classifier = _Classifier()
+    scanner = ImageScanner(crops, classifier, config={"crop_recheck": {"crop_cache_dir": crops}},
+                           stable_seconds=0, report_builder=False)
+    assert scanner.scan() == []
+    assert not classifier.calls

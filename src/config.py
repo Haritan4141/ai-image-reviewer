@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+import math
+import numbers
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -12,6 +14,11 @@ import yaml
 
 SUPPORTED_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp")
 REVIEW_MODES = ("lenient", "standard", "strict")
+CROP_MODES = ("fast", "balanced", "strict")
+CROP_DETECTOR_PROVIDERS = ("auto", "vlm", "none")
+CROP_DETECTOR_FAILURE_POLICIES = ("review",)
+CROP_TARGETS = ("face", "hand", "foot", "upper_body", "lower_body")
+SUPPORTED_CROP_TARGETS = ("face", "hand", "foot")
 RULE_MODE_PRESETS: dict[str, dict[str, float | int]] = {
     "lenient": {
         "threshold_pass": 0.70,
@@ -122,6 +129,77 @@ class RulesConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class CropTargetConfig:
+    """Whether a region kind participates in crop re-checking.
+
+    ``upper_body`` and ``lower_body`` are deliberately represented here even
+    though they are reserved for a future detector/prompt implementation.
+    The loader rejects enabling those reserved targets so an apparently
+    successful configuration can never silently skip requested checks.
+    """
+
+    enabled: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class CropPlannerConfig:
+    """Rules controlling when and how region crops are planned."""
+
+    run_on_review_only: bool = False
+    min_confidence_for_skip: float = 0.90
+    trigger_low_scores: tuple[str, ...] = ("hands", "face", "anatomy")
+    review_problem_keywords: tuple[str, ...] = (
+        "finger",
+        "hand",
+        "face",
+        "eye",
+        "foot",
+        "toe",
+    )
+    max_hand_crops: int = 4
+    max_face_crops: int = 2
+    max_foot_crops: int = 4
+    min_crop_size: int = 96
+    crop_padding_ratio: float = 0.15
+    dedup_iou: float = 0.50
+    min_detector_confidence: float = 0.80
+    large_foot_area: float = 0.04
+
+
+@dataclass(frozen=True, slots=True)
+class CropDetectorsConfig:
+    """Region detector selection and fail-safe behavior."""
+
+    provider: str = "auto"
+    allow_fallback: bool = True
+    detector_failure_policy: str = "review"
+    person_required_for_balanced: bool = True
+
+
+def _default_crop_targets() -> dict[str, CropTargetConfig]:
+    return {
+        "face": CropTargetConfig(enabled=True),
+        "hand": CropTargetConfig(enabled=True),
+        "foot": CropTargetConfig(enabled=True),
+        "upper_body": CropTargetConfig(enabled=False),
+        "lower_body": CropTargetConfig(enabled=False),
+    }
+
+
+@dataclass(frozen=True, slots=True)
+class CropRecheckConfig:
+    """Optional second-pass face/hand/foot inspection configuration."""
+
+    enabled: bool = False
+    mode: str = "balanced"
+    keep_crop_files: bool = True
+    crop_cache_dir: Path = Path("cache/crops")
+    planner: CropPlannerConfig = field(default_factory=CropPlannerConfig)
+    detectors: CropDetectorsConfig = field(default_factory=CropDetectorsConfig)
+    targets: Mapping[str, CropTargetConfig] = field(default_factory=_default_crop_targets)
+
+
+@dataclass(frozen=True, slots=True)
 class WatchConfig:
     paths: tuple[Path, ...] = ()
     recursive: bool = True
@@ -175,6 +253,7 @@ class AppConfig:
     lmstudio: LMStudioConfig = field(default_factory=LMStudioConfig)
     codex_cli: CodexCLIConfig = field(default_factory=CodexCLIConfig)
     rules: RulesConfig = field(default_factory=RulesConfig)
+    crop_recheck: CropRecheckConfig = field(default_factory=CropRecheckConfig)
     watch: WatchConfig = field(default_factory=WatchConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
     logs: LogsConfig = field(default_factory=LogsConfig)
@@ -209,6 +288,8 @@ class AppConfig:
             (self.output.directory / result).mkdir(parents=True, exist_ok=True)
         self.logs.directory.mkdir(parents=True, exist_ok=True)
         self.cache.directory.mkdir(parents=True, exist_ok=True)
+        if self.crop_recheck.enabled:
+            self.crop_recheck.crop_cache_dir.mkdir(parents=True, exist_ok=True)
 
 
 def _section(data: Mapping[str, Any], name: str) -> Mapping[str, Any]:
@@ -234,6 +315,62 @@ def _as_tuple(value: Any, *, name: str) -> tuple[str, ...]:
     return tuple(value)
 
 
+def _strict_bool(value: Any, *, name: str) -> bool:
+    """Read a YAML boolean without accepting truthy strings such as ``"false"``."""
+
+    if not isinstance(value, bool):
+        raise ConfigError(f"'{name}' must be a boolean (true or false)")
+    return value
+
+
+def _strict_number(value: Any, *, name: str) -> float:
+    """Read a finite, non-boolean YAML number."""
+
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        raise ConfigError(f"'{name}' must be a number")
+    number = float(value)
+    if not math.isfinite(number):
+        raise ConfigError(f"'{name}' must be finite")
+    return number
+
+
+def _strict_int(value: Any, *, name: str) -> int:
+    """Read a positive-count integer without truncating floats or strings."""
+
+    if isinstance(value, bool) or not isinstance(value, numbers.Integral):
+        raise ConfigError(f"'{name}' must be an integer")
+    return int(value)
+
+
+def _strict_enum(value: Any, *, name: str, choices: tuple[str, ...]) -> str:
+    if not isinstance(value, str):
+        raise ConfigError(f"'{name}' must be one of: {', '.join(choices)}")
+    normalized = value.strip().lower()
+    if normalized not in choices:
+        raise ConfigError(f"'{name}' must be one of: {', '.join(choices)}")
+    return normalized
+
+
+def _crop_targets(raw: Mapping[str, Any]) -> dict[str, CropTargetConfig]:
+    """Parse target entries while retaining all future-reserved keys."""
+
+    defaults = _default_crop_targets()
+    unknown = sorted(set(raw) - set(CROP_TARGETS))
+    if unknown:
+        raise ConfigError(
+            "crop_recheck.targets contains unsupported target(s): " + ", ".join(unknown)
+        )
+    parsed = dict(defaults)
+    for name, value in raw.items():
+        if not isinstance(value, Mapping):
+            raise ConfigError(f"'crop_recheck.targets.{name}' must be a YAML mapping")
+        enabled = value.get("enabled", defaults[name].enabled)
+        parsed[name] = CropTargetConfig(
+            enabled=_strict_bool(enabled, name=f"crop_recheck.targets.{name}.enabled")
+        )
+    return parsed
+
+
 def load_config(path: str | Path = "config.yaml") -> AppConfig:
     """Load YAML, resolve relative paths against the YAML directory, and validate."""
     config_path = Path(path).expanduser().resolve()
@@ -251,6 +388,10 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
     lm = _section(loaded, "lmstudio")
     codex = _section(loaded, "codex_cli")
     rules = _section(loaded, "rules")
+    crop = _section(loaded, "crop_recheck")
+    crop_planner = _section(crop, "planner")
+    crop_detectors = _section(crop, "detectors")
+    crop_targets = _section(crop, "targets")
     watch = _section(loaded, "watch")
     output = _section(loaded, "output")
     logs = _section(loaded, "logs")
@@ -318,6 +459,91 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
                 rules.get("fail_problem_keywords", list(RulesConfig().fail_problem_keywords)),
                 name="rules.fail_problem_keywords",
             ),
+        ),
+        crop_recheck=CropRecheckConfig(
+            enabled=_strict_bool(crop.get("enabled", False), name="crop_recheck.enabled"),
+            mode=_strict_enum(crop.get("mode", "balanced"), name="crop_recheck.mode", choices=CROP_MODES),
+            keep_crop_files=_strict_bool(
+                crop.get("keep_crop_files", True), name="crop_recheck.keep_crop_files"
+            ),
+            crop_cache_dir=_resolve_path(crop.get("crop_cache_dir", "cache/crops"), root),
+            planner=CropPlannerConfig(
+                run_on_review_only=_strict_bool(
+                    crop_planner.get("run_on_review_only", False),
+                    name="crop_recheck.planner.run_on_review_only",
+                ),
+                min_confidence_for_skip=_strict_number(
+                    crop_planner.get("min_confidence_for_skip", 0.90),
+                    name="crop_recheck.planner.min_confidence_for_skip",
+                ),
+                trigger_low_scores=_as_tuple(
+                    crop_planner.get(
+                        "trigger_low_scores",
+                        list(CropPlannerConfig().trigger_low_scores),
+                    ),
+                    name="crop_recheck.planner.trigger_low_scores",
+                ),
+                review_problem_keywords=_as_tuple(
+                    crop_planner.get(
+                        "review_problem_keywords",
+                        list(CropPlannerConfig().review_problem_keywords),
+                    ),
+                    name="crop_recheck.planner.review_problem_keywords",
+                ),
+                max_hand_crops=_strict_int(
+                    crop_planner.get("max_hand_crops", 4),
+                    name="crop_recheck.planner.max_hand_crops",
+                ),
+                max_face_crops=_strict_int(
+                    crop_planner.get("max_face_crops", 2),
+                    name="crop_recheck.planner.max_face_crops",
+                ),
+                max_foot_crops=_strict_int(
+                    crop_planner.get("max_foot_crops", 4),
+                    name="crop_recheck.planner.max_foot_crops",
+                ),
+                min_crop_size=_strict_int(
+                    crop_planner.get("min_crop_size", 96),
+                    name="crop_recheck.planner.min_crop_size",
+                ),
+                crop_padding_ratio=_strict_number(
+                    crop_planner.get("crop_padding_ratio", 0.15),
+                    name="crop_recheck.planner.crop_padding_ratio",
+                ),
+                dedup_iou=_strict_number(
+                    crop_planner.get("dedup_iou", 0.50),
+                    name="crop_recheck.planner.dedup_iou",
+                ),
+                min_detector_confidence=_strict_number(
+                    crop_planner.get("min_detector_confidence", 0.80),
+                    name="crop_recheck.planner.min_detector_confidence",
+                ),
+                large_foot_area=_strict_number(
+                    crop_planner.get("large_foot_area", 0.04),
+                    name="crop_recheck.planner.large_foot_area",
+                ),
+            ),
+            detectors=CropDetectorsConfig(
+                provider=_strict_enum(
+                    crop_detectors.get("provider", "auto"),
+                    name="crop_recheck.detectors.provider",
+                    choices=CROP_DETECTOR_PROVIDERS,
+                ),
+                allow_fallback=_strict_bool(
+                    crop_detectors.get("allow_fallback", True),
+                    name="crop_recheck.detectors.allow_fallback",
+                ),
+                detector_failure_policy=_strict_enum(
+                    crop_detectors.get("detector_failure_policy", "review"),
+                    name="crop_recheck.detectors.detector_failure_policy",
+                    choices=CROP_DETECTOR_FAILURE_POLICIES,
+                ),
+                person_required_for_balanced=_strict_bool(
+                    crop_detectors.get("person_required_for_balanced", True),
+                    name="crop_recheck.detectors.person_required_for_balanced",
+                ),
+            ),
+            targets=_crop_targets(crop_targets),
         ),
         watch=WatchConfig(
             paths=watch_paths,
@@ -406,6 +632,7 @@ def _validate(config: AppConfig) -> None:
         raise ConfigError("lmstudio.max_image_dimension must be at least 256")
     if not config.processing.extensions:
         raise ConfigError("processing.extensions must not be empty")
+    _validate_crop_recheck(config.crop_recheck)
     output_key = os.path.normcase(os.path.normpath(os.fspath(config.output.directory)))
     for watch_path in config.watch.paths:
         try:
@@ -414,3 +641,116 @@ def _validate(config: AppConfig) -> None:
             continue
         if os.path.normcase(os.path.normpath(common)) == output_key:
             raise ConfigError("watch paths must not be inside the configured output directory")
+
+
+def _validate_crop_recheck(config: CropRecheckConfig) -> None:
+    """Validate crop settings independently from the legacy full-image rules."""
+
+    if not isinstance(config.enabled, bool):
+        raise ConfigError("crop_recheck.enabled must be a boolean")
+    if config.mode not in CROP_MODES:
+        raise ConfigError("crop_recheck.mode must be 'fast', 'balanced', or 'strict'")
+    if not isinstance(config.keep_crop_files, bool):
+        raise ConfigError("crop_recheck.keep_crop_files must be a boolean")
+    if not isinstance(config.crop_cache_dir, Path) or not config.crop_cache_dir.is_absolute():
+        raise ConfigError("crop_recheck.crop_cache_dir must resolve to an absolute path")
+
+    planner = config.planner
+    if not isinstance(planner.run_on_review_only, bool):
+        raise ConfigError("crop_recheck.planner.run_on_review_only must be a boolean")
+    _range_number(
+        planner.min_confidence_for_skip,
+        name="crop_recheck.planner.min_confidence_for_skip",
+        lower=0,
+        upper=1,
+    )
+    _string_tuple(planner.trigger_low_scores, name="crop_recheck.planner.trigger_low_scores")
+    if set(planner.trigger_low_scores) - {"hands", "face", "anatomy", "artifacts", "composition"}:
+        raise ConfigError("crop_recheck.planner.trigger_low_scores contains an unknown score name")
+    _string_tuple(
+        planner.review_problem_keywords,
+        name="crop_recheck.planner.review_problem_keywords",
+    )
+    for field_name in ("max_hand_crops", "max_face_crops", "max_foot_crops", "min_crop_size"):
+        value = getattr(planner, field_name)
+        if isinstance(value, bool) or not isinstance(value, numbers.Integral) or int(value) < 1:
+            raise ConfigError(f"crop_recheck.planner.{field_name} must be a positive integer")
+    _range_number(
+        planner.crop_padding_ratio,
+        name="crop_recheck.planner.crop_padding_ratio",
+        lower=0,
+        upper=1,
+    )
+    _range_number(planner.dedup_iou, name="crop_recheck.planner.dedup_iou", lower=0, upper=1,
+                  inclusive_lower=False)
+    _range_number(
+        planner.min_detector_confidence,
+        name="crop_recheck.planner.min_detector_confidence",
+        lower=0,
+        upper=1,
+    )
+    _range_number(
+        planner.large_foot_area,
+        name="crop_recheck.planner.large_foot_area",
+        lower=0,
+        upper=1,
+        inclusive_lower=False,
+    )
+
+    detectors = config.detectors
+    if detectors.provider not in CROP_DETECTOR_PROVIDERS:
+        raise ConfigError("crop_recheck.detectors.provider must be 'auto', 'vlm', or 'none'")
+    if not isinstance(detectors.allow_fallback, bool):
+        raise ConfigError("crop_recheck.detectors.allow_fallback must be a boolean")
+    if detectors.detector_failure_policy not in CROP_DETECTOR_FAILURE_POLICIES:
+        raise ConfigError(
+            "crop_recheck.detectors.detector_failure_policy must be 'review'"
+        )
+    if not isinstance(detectors.person_required_for_balanced, bool):
+        raise ConfigError(
+            "crop_recheck.detectors.person_required_for_balanced must be a boolean"
+        )
+
+    if not isinstance(config.targets, Mapping):
+        raise ConfigError("crop_recheck.targets must be a mapping")
+    unknown = sorted(set(config.targets) - set(CROP_TARGETS))
+    if unknown:
+        raise ConfigError(
+            "crop_recheck.targets contains unsupported target(s): " + ", ".join(unknown)
+        )
+    for target_name, target in config.targets.items():
+        if not isinstance(target, CropTargetConfig):
+            raise ConfigError(f"crop_recheck.targets.{target_name} must be a target mapping")
+        if not isinstance(target.enabled, bool):
+            raise ConfigError(f"crop_recheck.targets.{target_name}.enabled must be a boolean")
+    for reserved in ("upper_body", "lower_body"):
+        target = config.targets.get(reserved)
+        if target is not None and target.enabled:
+            raise ConfigError(
+                f"crop_recheck.targets.{reserved} is reserved for a future implementation; "
+                "leave enabled: false"
+            )
+
+
+def _range_number(
+    value: Any,
+    *,
+    name: str,
+    lower: float,
+    upper: float,
+    inclusive_lower: bool = True,
+) -> None:
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        raise ConfigError(f"{name} must be a finite number")
+    number = float(value)
+    if not math.isfinite(number):
+        raise ConfigError(f"{name} must be a finite number")
+    lower_ok = number >= lower if inclusive_lower else number > lower
+    if not lower_ok or number > upper:
+        bracket = "<=" if inclusive_lower else "<"
+        raise ConfigError(f"{name} must satisfy {lower} {bracket} value <= {upper}")
+
+
+def _string_tuple(value: Any, *, name: str) -> None:
+    if not isinstance(value, tuple) or not value or any(not item.strip() for item in value):
+        raise ConfigError(f"{name} must be a non-empty list of strings")

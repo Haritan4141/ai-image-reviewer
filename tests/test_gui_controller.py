@@ -69,6 +69,9 @@ def test_config_store_saves_gui_fields_without_weakening_auth_guard(tmp_path: Pa
         backend="lmstudio",
         reasoning_effort="medium",
         review_mode="strict",
+        crop_recheck_enabled=True,
+        crop_mode="strict",
+        keep_crop_files=False,
         lmstudio_url="http://192.168.0.104:1234/v1/",
         lmstudio_model="vision-model",
         operation="move",
@@ -85,6 +88,14 @@ def test_config_store_saves_gui_fields_without_weakening_auth_guard(tmp_path: Pa
     assert config.codex_cli.reasoning_effort == "medium"
     assert config.rules.mode == "strict"
     assert config.rules.score_fail_below == 3
+    assert config.crop_recheck.enabled is True
+    assert config.crop_recheck.mode == "strict"
+    assert config.crop_recheck.keep_crop_files is False
+    # Advanced crop planner/detector settings remain untouched by GUI saves.
+    assert config.crop_recheck.planner.max_hand_crops == 4
+    assert config.crop_recheck.planner.min_detector_confidence == 0.80
+    assert config.crop_recheck.detectors.provider == "auto"
+    assert config.crop_recheck.targets["upper_body"].enabled is False
     assert config.codex_cli.timeout_seconds == 321
     assert config.codex_cli.require_chatgpt_login is True
     assert config.lmstudio.base_url == "http://192.168.0.104:1234/v1"
@@ -100,6 +111,8 @@ def test_desktop_validation_uses_official_luna_efforts_and_safe_paths(tmp_path: 
         validate_desktop_settings(replace(settings, reasoning_effort="extreme"))
     with pytest.raises(ConfigError, match="判定基準"):
         validate_desktop_settings(replace(settings, review_mode="unknown"))
+    with pytest.raises(ConfigError, match="クロップ再判定モード"):
+        validate_desktop_settings(replace(settings, crop_mode="unknown"))
 
     output = tmp_path / "output"
     nested_input = output / "incoming"
