@@ -13,7 +13,16 @@ from typing import Any, Mapping, Protocol, Sequence
 import requests
 
 from .models import ClassificationResult, decode_json_object
-from .prompts import build_correction_messages, build_messages
+from .prompts import (
+    LOCALIZATION_CORRECTION_PROMPT,
+    LOCALIZATION_OUTPUT_SCHEMA,
+    build_correction_messages,
+    build_localization_messages,
+    build_messages_for_target,
+    normalize_localization_payload,
+    normalize_target,
+    unknown_localization,
+)
 
 
 class LMStudioError(RuntimeError):
@@ -26,6 +35,12 @@ class LMStudioHTTPError(LMStudioError):
 
 class LMStudioResponseError(LMStudioError):
     """The server response was not usable as the required JSON object."""
+
+
+def _classification_from_model_payload(value: object) -> ClassificationResult:
+    """Do not accept application-owned audit metadata from the model."""
+
+    return ClassificationResult.from_model_mapping(value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,10 +145,12 @@ def image_to_data_url(
 ) -> str:
     """Convert an image path or bytes to a multimodal ``data:`` URL.
 
-    If Pillow is available and ``max_dimension`` is positive, oversized images
-    are downscaled before encoding.  This keeps requests practical for a local
-    GPU while preserving the original file on disk.  Pillow is imported lazily
-    so the client remains importable in API-only tests.
+    Pillow is used when available to normalize EXIF orientation for every valid
+    image, including images below the size limit, and to downscale oversized
+    inputs. This keeps localization coordinates and later crops in the same
+    upright coordinate space while preserving the original file on disk.
+    Pillow is imported lazily so the client remains importable in API-only
+    tests.
     """
 
     if isinstance(image, str) and image.startswith("data:"):
@@ -150,32 +167,32 @@ def image_to_data_url(
     else:
         raise TypeError("image must be a path or bytes")
 
-    if max_dimension and max_dimension > 0:
-        try:
-            from PIL import Image
+    try:
+        from PIL import Image, ImageOps
 
-            with Image.open(io.BytesIO(payload)) as opened:
-                width, height = opened.size
-                if max(width, height) > max_dimension:
-                    scale = max_dimension / max(width, height)
-                    resized = opened.resize(
-                        (max(1, round(width * scale)), max(1, round(height * scale))),
-                        Image.Resampling.LANCZOS,
-                    )
-                    # JPEG is broadly accepted and substantially smaller for
-                    # RGB/RGBA photographs.  Keep PNG for palette/alpha cases.
-                    if mime in {"image/jpeg", "image/jpg"} and resized.mode not in {"RGB", "L"}:
-                        resized = resized.convert("RGB")
-                    output = io.BytesIO()
-                    save_format = "JPEG" if mime in {"image/jpeg", "image/jpg"} else "PNG"
-                    save_kwargs = {"quality": jpeg_quality} if save_format == "JPEG" else {}
-                    resized.save(output, format=save_format, **save_kwargs)
-                    payload = output.getvalue()
-                    mime = "image/jpeg" if save_format == "JPEG" else "image/png"
-        except (ImportError, OSError, ValueError):
-            # Encoding the original bytes is a safe fallback for an unusual or
-            # partially written image.  The VLM can still return REVIEW.
-            pass
+        with Image.open(io.BytesIO(payload)) as opened:
+            normalized = ImageOps.exif_transpose(opened).copy()
+            if max_dimension and max_dimension > 0 and max(normalized.size) > max_dimension:
+                scale = max_dimension / max(normalized.size)
+                normalized = normalized.resize(
+                    (max(1, round(normalized.width * scale)), max(1, round(normalized.height * scale))),
+                    Image.Resampling.LANCZOS,
+                )
+
+            # JPEG cannot represent alpha/palette modes. PNG is retained for
+            # other inputs so transparent crop images remain lossless.
+            save_format = "JPEG" if mime in {"image/jpeg", "image/jpg"} else "PNG"
+            if save_format == "JPEG" and normalized.mode not in {"RGB", "L"}:
+                normalized = normalized.convert("RGB")
+            output = io.BytesIO()
+            save_kwargs = {"quality": jpeg_quality} if save_format == "JPEG" else {}
+            normalized.save(output, format=save_format, **save_kwargs)
+            payload = output.getvalue()
+            mime = "image/jpeg" if save_format == "JPEG" else "image/png"
+    except (ImportError, OSError, ValueError):
+        # Encoding the original bytes is a safe fallback for an unusual or
+        # partially written image. The VLM can still return REVIEW.
+        pass
 
     encoded = base64.b64encode(payload).decode("ascii")
     return f"data:{mime};base64,{encoded}"
@@ -210,6 +227,7 @@ class LMStudioClient:
         retry_delay_seconds: float | None = None,
         max_image_dimension: int | None = None,
         jpeg_quality: int | None = None,
+        review_mode: str | None = None,
     ) -> None:
         overrides = {
             key: value
@@ -221,6 +239,7 @@ class LMStudioClient:
                 "retry_delay_seconds": retry_delay_seconds,
                 "max_image_dimension": max_image_dimension,
                 "jpeg_quality": jpeg_quality,
+                "review_mode": review_mode,
             }.items()
             if value is not None
         }
@@ -288,12 +307,21 @@ class LMStudioClient:
             raise LMStudioResponseError("LM Studio returned empty message content")
         return text
 
-    def request_json(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
+    def request_json(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        correction_prompt: str | None = None,
+        validator: Any | None = None,
+        response_name: str = "classification",
+    ) -> dict[str, Any]:
         """Send a chat request and return a decoded JSON object.
 
         ``retries`` applies to both transport errors and malformed model
         responses.  For malformed content each retry appends a correction turn
-        that explicitly asks for JSON-only output.
+        that explicitly asks for JSON-only output. ``correction_prompt`` and
+        ``validator`` allow another response contract, such as localization,
+        to use matching repair instructions and structural validation.
         """
 
         attempts = self.config.retries + 1
@@ -302,11 +330,16 @@ class LMStudioClient:
         current_messages = messages
         for attempt in range(attempts):
             if attempt:
-                current_messages = build_correction_messages(messages, invalid_text)
+                current_messages = build_correction_messages(
+                    messages,
+                    invalid_text,
+                    correction_prompt=correction_prompt,
+                )
             try:
                 text = self._post(current_messages)
                 invalid_text = text
-                return decode_json_object(text)
+                payload = decode_json_object(text)
+                return validator(payload) if callable(validator) else payload
             except (LMStudioError, ValueError) as exc:
                 last_error = exc
                 if attempt + 1 < attempts and self.config.retry_delay_seconds > 0:
@@ -314,7 +347,8 @@ class LMStudioClient:
         if isinstance(last_error, LMStudioHTTPError):
             raise last_error
         raise LMStudioResponseError(
-            f"LM Studio did not provide valid classification JSON after {attempts} attempt(s): {last_error}"
+            f"LM Studio did not provide valid {response_name} JSON after "
+            f"{attempts} attempt(s): {last_error}"
         ) from last_error
 
     def classify_image(
@@ -322,18 +356,57 @@ class LMStudioClient:
         image: str | Path | bytes,
         *,
         image_name: str | None = None,
+        target: str = "full",
+        region_index: int | None = None,
     ) -> ClassificationResult:
-        """Inspect one image and return a normalised VLM result."""
+        """Inspect one image or target crop and return a normalised result."""
 
+        selected_target = normalize_target(target)
         data_url = image_to_data_url(
             image,
             max_dimension=self.config.max_image_dimension,
             jpeg_quality=self.config.jpeg_quality,
         )
         payload = self.request_json(
-            build_messages(data_url, image_name=image_name, mode=self.config.review_mode)
+            build_messages_for_target(
+                data_url,
+                image_name=image_name,
+                target=selected_target,
+                mode=self.config.review_mode,
+                region_index=region_index,
+            )
         )
-        return ClassificationResult.from_mapping(payload)
+        return _classification_from_model_payload(payload)
+
+    def locate_regions(
+        self,
+        image: str | Path | bytes,
+        *,
+        image_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Locate visible regions using a separate, validated JSON contract.
+
+        ``person_present: false`` with ``not_visible`` is a successful absence
+        claim. A transport, model, or schema failure becomes explicit unknown
+        (``person_present: null`` with no ``not_visible`` claims), allowing the
+        crop pipeline to apply its own REVIEW-oriented failure policy.
+        """
+
+        try:
+            data_url = image_to_data_url(
+                image,
+                max_dimension=self.config.max_image_dimension,
+                jpeg_quality=self.config.jpeg_quality,
+            )
+            payload = self.request_json(
+                build_localization_messages(data_url, image_name=image_name),
+                correction_prompt=LOCALIZATION_CORRECTION_PROMPT,
+                validator=normalize_localization_payload,
+                response_name="localization",
+            )
+            return normalize_localization_payload(payload)
+        except (LMStudioError, OSError, ValueError) as exc:
+            return unknown_localization(f"localization failed: {type(exc).__name__}")
 
     # ``analyze_image`` reads naturally in pipeline code and is kept as an
     # alias for callers that do not want to couple themselves to classifier.py.
@@ -378,6 +451,7 @@ class LMStudioClient:
 
 
 __all__ = [
+    "LOCALIZATION_OUTPUT_SCHEMA",
     "LMStudioClient",
     "LMStudioClientConfig",
     "LMStudioError",

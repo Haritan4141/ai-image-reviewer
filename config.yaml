@@ -74,6 +74,46 @@ rules:
     - unrecognizable face
     - heavy generation noise
 
+# Optional close-up re-check for small faces, hands, and feet. Disabled by
+# default for backwards compatibility. Balanced is recommended when enabled;
+# it adds one region-detection request plus N crop-inference requests per
+# image (N depends on the detected regions and selected targets).
+crop_recheck:
+  enabled: false
+  mode: balanced            # fast / balanced (recommended) / strict
+  keep_crop_files: true
+  crop_cache_dir: cache/crops
+  planner:
+    run_on_review_only: false
+    min_confidence_for_skip: 0.90
+    trigger_low_scores: [hands, face, anatomy]
+    review_problem_keywords: [finger, hand, face, eye, foot, toe]
+    max_hand_crops: 4
+    max_face_crops: 2
+    max_foot_crops: 4
+    min_crop_size: 96
+    crop_padding_ratio: 0.15
+    dedup_iou: 0.50
+    min_detector_confidence: 0.80
+    large_foot_area: 0.04
+  detectors:
+    provider: auto          # auto / vlm / none
+    allow_fallback: true
+    detector_failure_policy: review
+    person_required_for_balanced: true
+  targets:
+    face:
+      enabled: true
+    hand:
+      enabled: true
+    foot:
+      enabled: true
+    # Reserved for future detector/prompt support; enabling these is rejected.
+    upper_body:
+      enabled: false
+    lower_body:
+      enabled: false
+
 logs:
   directory: logs
   results_jsonl: results.jsonl

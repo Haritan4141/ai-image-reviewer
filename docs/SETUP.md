@@ -77,14 +77,15 @@ python gui.py
 2. `Codex CLI / ChatGPT`または`LM Studio / ローカル`タブを選ぶ
 3. Codexではモデルと推論設定、LM StudioではAPI URLとモデルを指定する
 4. 判定基準は最初に`標準（推奨）`を選ぶ
-5. `接続確認`を実行する
-6. `copy`のまま、少数画像で`一括スキャン開始`を実行する
-7. モデル判定・最終判定・判定源と`review.html`を目視確認する
-8. 問題がなければ`フォルダ監視開始`へ進む
+5. 必要なら「追加確認（クロップ再判定）」を有効にし、通常は`Balanced（推奨）`を選ぶ
+6. `接続確認`を実行する
+7. `copy`のまま、少数画像で`一括スキャン開始`を実行する
+8. モデル判定・最終判定・判定源、crop原因と`review.html`を目視確認する
+9. 問題がなければ`フォルダ監視開始`へ進む
 
-GUIの設定は`config.local.yaml`へ保存されます。`標準`では意図的なアニメ調・誇張・重なりを許容し、裏付けのないモデルFAILをREVIEWへ戻します。`厳格`は小さな不確実性まで拾うため、FAIL過多になる場合があります。CodexではChatGPT認証以外を拒否する設定が常に維持されます。
+GUIの設定は`config.local.yaml`へ保存されます。`標準`では意図的なアニメ調・誇張・重なりを許容し、裏付けのないモデルFAILをREVIEWへ戻します。`厳格`は小さな不確実性まで拾うため、FAIL過多になる場合があります。クロップ再判定の`Fast / Balanced / Strict`は確認量の設定で、判定基準の`緩め / 標準 / 厳格`とは別です。CodexではChatGPT認証以外を拒否する設定が常に維持されます。
 
-停止ボタンは処理中の画像を破損させないため、その1枚の判定終了後に停止します。`move`を選ぶと元画像が移動するため、実行前に確認ダイアログが表示されます。
+停止ボタンは処理中の画像を破損させないため、その1枚の判定終了後に停止します。クロップ中に停止した画像は未確認理由付きで`REVIEW`として記録される場合があります。設定変更後やキャンセル済み画像の再評価には「処理済み画像も再判定」を有効にしてください。`move`を選ぶと元画像が移動するため、実行前に確認ダイアログが表示されます。
 
 ## 6. `config.yaml` の編集
 
@@ -116,6 +117,13 @@ notepad config.local.yaml
 | `lmstudio.retries` | API 失敗時の再試行回数 | `2` |
 | `processing.parallel_workers` | 並列数 | 初回は `1` |
 | `rules.*` | confidence／スコア／問題語の安全ルール | 設定例を参照 |
+| `crop_recheck.enabled` | 顔・手・足の追加確認 | 初期値`false`。有効化を推奨 |
+| `crop_recheck.mode` | crop確認量 | `fast` / `balanced` / `strict`。`balanced`推奨 |
+| `crop_recheck.keep_crop_files` | cropサムネイルを保持 | `true` / `false` |
+| `crop_recheck.crop_cache_dir` | 一時crop保存先 | `cache/crops` |
+| `crop_recheck.planner.*` | trigger、候補数、padding、最小サイズ等 | 既定値は実装設計を参照 |
+| `crop_recheck.detectors.*` | VLM領域検出と失敗時方針 | `auto` / `vlm` / `none` |
+| `crop_recheck.targets.*` | face / hand / footの対象 | upper/lower bodyは予約 |
 | `cache.use_content_hash` | ハッシュによる重複抑止 | `true` |
 | `report.*` | HTML とサムネイル設定 | 設定例を参照 |
 
@@ -157,6 +165,26 @@ Start-Process .\review.html
 
 `results.jsonl`、`latest_summary.csv`、仕分け先ファイル、`review.html` が作成されることを確認します。期待どおりであることを確認するまで、元画像フォルダ全体の監視や `move` へ切り替えないでください。
 
+### クロップ再判定を有効にする場合
+
+配布用`config.yaml`では後方互換性のため無効です。GUIで「追加確認（クロップ再判定）」を有効にするか、設定へ次を追加します。
+
+```yaml
+crop_recheck:
+  enabled: true
+  mode: balanced
+  keep_crop_files: true
+  crop_cache_dir: cache/crops
+  detectors:
+    provider: auto
+    allow_fallback: true
+    detector_failure_policy: review
+```
+
+`auto` / `vlm`は選択中のLM StudioまたはCodex CLIのVLMに領域検出を依頼します。別の検出器モデルや固定グリッドは使用しません。`none`、利用不能、JSON不正、候補の低信頼はアプリを停止させず、必要な部位を`REVIEW`へ倒します。1画像あたりの最大呼び出しは、再試行を除きfull 1回＋領域検出1回＋face 2回＋hand 4回＋foot 4回です。
+
+full `PASS`にcrop `REVIEW`／`FAIL`があれば最終結果は少なくとも`REVIEW`です。crop `PASS`だけでfull `REVIEW`を`PASS`へ戻しません。保持したcropは`review.html`で確認できますが、実画像のprecision/recallは未校正であり、現時点の自動テストはstub中心です。
+
 ## 8. 監視の開始
 
 設定ファイルの対象を確認後、監視を開始します。
@@ -167,11 +195,13 @@ python main.py --config config.local.yaml watch
 
 `Ctrl+C` で停止します。生成アプリが書き込み中の画像を監視する場合は `file_stable_seconds` を十分な値にし、未完成ファイルを VLM に送らないようにします。ネットワーク共有では `polling` が安定することがあります。
 
+停止後に同じ画像を設定変更後の条件でやり直すには、GUIの「処理済み画像も再判定」を使うか、CLIで`--force`を付けます。`cache/processed.json`は画像hashだけを管理し、crop単位のresume／推論結果cacheはありません。
+
 ## 9. タスクスケジューラ（任意）
 
 常駐させる場合は、`.venv\Scripts\python.exe` と `main.py` の絶対パス、プロジェクトルートを作業フォルダに指定します。「ユーザーがログオンしているかどうかにかかわらず実行」では UNC の資格情報が別になる場合があるため、対話型 PowerShell と同じユーザー／資格情報でまず検証してください。失敗時に無限再試行しないこと、ログを定期確認することも必要です。
 
-## 9. 更新とバックアップ
+## 10. 更新とバックアップ
 
 ```powershell
 & .\.venv\Scripts\Activate.ps1
@@ -180,7 +210,7 @@ python -m pytest -q
 python main.py --config config.local.yaml test-codex
 ```
 
-更新前に `config*.yaml`、`logs/`、`cache/`、仕分け済み画像をバックアップします。依存関係更新後は少数画像で再確認してください。
+更新前に `config*.yaml`、`logs/`、`cache/`（保持cropを含む）、仕分け済み画像をバックアップします。依存関係更新後は少数画像で再確認してください。実VLMの品質測定は自動テストに含まれないため、バックエンド接続テストと目視確認を別途行います。
 
 ## トラブルシューティング早見表
 
@@ -191,5 +221,7 @@ python main.py --config config.local.yaml test-codex
 | モデルが画像を受け付けない | VLM の画像対応、API のモデル ID、画像 MIME |
 | UNC が見えない | 同じユーザーで `Test-Path`、共有／NTFS 権限、資格情報 |
 | 結果が全て REVIEW | JSON 応答、confidence/スコア、`rules` の閾値と問題語 |
+| cropが全てREVIEW | `detectors.provider`、領域検出JSON、検出信頼度、`review.html`のpipeline理由 |
+| 設定変更が反映されない | hash cacheが残っているためGUI forceまたは`scan --force`。`rescan-review`は`output/review`を対象 |
 | コピー失敗 | 出力先権限、同名ファイル、ファイルロック、容量 |
 | 監視が重複する | 二重起動、安定化待ち、ハッシュ、ポーリング間隔 |

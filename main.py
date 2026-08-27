@@ -116,7 +116,10 @@ def _make_pipeline(
             config.rules.mode,
             config.lmstudio.base_url,
         )
-    classifier = ImageClassifier(client, LocalRulesConfig.from_settings(config.rules))
+    classifier = ImageClassifier(client, LocalRulesConfig.from_settings(config.rules),
+                                 crop_config=config.crop_recheck, logger=logger)
+    logger.info("クロップ再判定: enabled=%s / mode=%s / detector=%s",
+                config.crop_recheck.enabled, config.crop_recheck.mode, config.crop_recheck.detectors.provider)
     sorter = ImageSorter(config=config, source_roots=roots)
     report = ReportBuilder(config=config)
     scanner = ImageScanner(

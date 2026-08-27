@@ -13,7 +13,16 @@ import time
 from typing import Any, Callable, Mapping, Sequence
 
 from .models import ClassificationResult, decode_json_object
-from .prompts import build_system_prompt, build_user_prompt
+from .prompts import (
+    LOCALIZATION_OUTPUT_SCHEMA,
+    build_localization_messages,
+    build_messages_for_target,
+    build_target_system_prompt,
+    build_target_user_prompt,
+    normalize_localization_payload,
+    normalize_target,
+    unknown_localization,
+)
 
 
 CLASSIFICATION_OUTPUT_SCHEMA: dict[str, Any] = {
@@ -51,6 +60,12 @@ class CodexCLIAuthError(CodexCLIError):
 
 class CodexCLIResponseError(CodexCLIError):
     """Codex completed but did not return a usable classification object."""
+
+
+def _classification_from_model_payload(value: object) -> ClassificationResult:
+    """Do not accept application-owned audit metadata from the model."""
+
+    return ClassificationResult.from_model_mapping(value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -261,29 +276,62 @@ class CodexCLIClient:
         command.append("-")
         return command
 
-    def _prompt(self, image_name: str | None) -> str:
+    def _prompt(
+        self,
+        image_name: str | None,
+        *,
+        target: str = "full",
+        region_index: int | None = None,
+    ) -> str:
+        selected_target = normalize_target(target)
         return (
-            build_system_prompt(self.config.review_mode)
+            build_target_system_prompt(selected_target, self.config.review_mode)
             + "\n\n"
-            + build_user_prompt(image_name, mode=self.config.review_mode)
+            + build_target_user_prompt(
+                image_name,
+                target=selected_target,
+                mode=self.config.review_mode,
+                region_index=region_index,
+            )
+            + "\n\nAnalyze only the attached image. Do not inspect repository files, run shell "
+            "commands, use external tools, or modify any file. Return only the requested JSON object."
+        )
+
+    @staticmethod
+    def _localization_prompt(image_name: str | None) -> str:
+        messages = build_localization_messages("data:image/png;base64,PLACEHOLDER", image_name)
+        system = str(messages[0]["content"])
+        user = str(messages[1]["content"][0]["text"])
+        return (
+            system
+            + "\n\n"
+            + user
             + "\n\nAnalyze only the attached image. Do not inspect repository files, run shell "
             "commands, use external tools, or modify any file. Return only the requested JSON object."
         )
 
     def _prepare_image(self, source: Path, temp_root: Path) -> Path:
-        """Downscale oversized inputs without changing the original image."""
+        """Normalize EXIF orientation and downscale without changing source.
+
+        Even images below the size limit are re-encoded after EXIF transpose so
+        localization boxes and later crops always share upright coordinates.
+        Invalid/partially-written files retain the old safe fallback of passing
+        the source path through to the CLI, which keeps diagnostics useful.
+        """
 
         try:
             from PIL import Image, ImageOps
 
             with Image.open(source) as opened:
-                image = ImageOps.exif_transpose(opened)
-                if max(image.size) <= self.config.max_image_dimension:
-                    return source
-                image.thumbnail(
-                    (self.config.max_image_dimension, self.config.max_image_dimension),
-                    Image.Resampling.LANCZOS,
-                )
+                image = ImageOps.exif_transpose(opened).copy()
+                if (
+                    self.config.max_image_dimension > 0
+                    and max(image.size) > self.config.max_image_dimension
+                ):
+                    image.thumbnail(
+                        (self.config.max_image_dimension, self.config.max_image_dimension),
+                        Image.Resampling.LANCZOS,
+                    )
                 if image.mode in {"RGBA", "LA"}:
                     rgba = image.convert("RGBA")
                     flattened = Image.new("RGB", rgba.size, "white")
@@ -291,27 +339,28 @@ class CodexCLIClient:
                     image = flattened
                 elif image.mode != "RGB":
                     image = image.convert("RGB")
-                prepared = temp_root / "prepared-image.jpg"
-                image.save(prepared, format="JPEG", quality=self.config.jpeg_quality)
+                source_format = str(opened.format or "").upper()
+                if source_format in {"JPEG", "JPG"}:
+                    prepared = temp_root / "prepared-image.jpg"
+                    image.save(prepared, format="JPEG", quality=self.config.jpeg_quality)
+                else:
+                    prepared = temp_root / "prepared-image.png"
+                    image.save(prepared, format="PNG")
                 return prepared
         except (ImportError, OSError, ValueError):
             return source
 
-    def classify_image(
+    def _request_json(
         self,
-        image: str | Path,
+        image_path: Path,
         *,
-        image_name: str | None = None,
-    ) -> ClassificationResult:
-        """Classify one image using the ChatGPT-authenticated Codex CLI."""
-
-        image_path = Path(image).expanduser().resolve()
-        if not image_path.is_file():
-            raise CodexCLIError(f"image file was not found: {image_path}")
-
-        # Re-check before every model request. A long-running watch process must
-        # stop if another Codex session switches this Windows user to API-key auth.
-        self.get_status(refresh=True)
+        schema: Mapping[str, Any],
+        schema_name: str,
+        output_name: str,
+        prompt: str,
+        parser: Callable[[object], Any],
+    ) -> Any:
+        """Run one or more bounded schema-constrained Codex requests."""
 
         attempts = self.config.retries + 1
         last_error: Exception | None = None
@@ -319,16 +368,16 @@ class CodexCLIClient:
             try:
                 with tempfile.TemporaryDirectory(prefix="ai-image-reviewer-codex-") as temp_dir:
                     temp_root = Path(temp_dir)
-                    schema_path = temp_root / "classification.schema.json"
-                    output_path = temp_root / "classification.result.json"
+                    schema_path = temp_root / f"{schema_name}.schema.json"
+                    output_path = temp_root / output_name
                     prepared_image = self._prepare_image(image_path, temp_root)
                     schema_path.write_text(
-                        json.dumps(CLASSIFICATION_OUTPUT_SCHEMA, ensure_ascii=False, indent=2),
+                        json.dumps(schema, ensure_ascii=False, indent=2),
                         encoding="utf-8",
                     )
                     completed = self._run(
                         self._command(prepared_image, schema_path, output_path),
-                        input_text=self._prompt(image_name or image_path.name),
+                        input_text=prompt,
                     )
                     if completed.returncode != 0:
                         detail = self._combined_output(completed)[:1000]
@@ -341,15 +390,84 @@ class CodexCLIClient:
                         else completed.stdout
                     )
                     payload = decode_json_object(text)
-                    return ClassificationResult.from_mapping(payload)
+                    return parser(payload)
             except (CodexCLIError, OSError, ValueError) as exc:
                 last_error = exc
                 if attempt + 1 < attempts and self.config.retry_delay_seconds > 0:
                     time.sleep(self.config.retry_delay_seconds)
 
         raise CodexCLIResponseError(
-            f"Codex CLI did not provide valid classification JSON after {attempts} attempt(s): {last_error}"
+            f"Codex CLI did not provide valid {schema_name} JSON after "
+            f"{attempts} attempt(s): {last_error}"
         ) from last_error
+
+    def classify_image(
+        self,
+        image: str | Path,
+        *,
+        image_name: str | None = None,
+        target: str = "full",
+        region_index: int | None = None,
+    ) -> ClassificationResult:
+        """Classify one image or target crop using the Codex CLI.
+
+        ``target`` is deliberately explicit so the crop pipeline has the same
+        backend contract as LM Studio. Every target keeps the full five-score
+        classification JSON schema; only the prompt scope changes.
+        """
+
+        selected_target = normalize_target(target)
+        image_path = Path(image).expanduser().resolve()
+        if not image_path.is_file():
+            raise CodexCLIError(f"image file was not found: {image_path}")
+
+        # Re-check before every public model request. A long-running watch
+        # process must stop if another Codex session switches this user to
+        # API-key auth.
+        self.get_status(refresh=True)
+        return self._request_json(
+            image_path,
+            schema=CLASSIFICATION_OUTPUT_SCHEMA,
+            schema_name="classification",
+            output_name="classification.result.json",
+            prompt=self._prompt(
+                image_name or image_path.name,
+                target=selected_target,
+                region_index=region_index,
+            ),
+            parser=_classification_from_model_payload,
+        )
+
+    def locate_regions(
+        self,
+        image: str | Path,
+        *,
+        image_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Locate visible target regions with a separate JSON schema.
+
+        A valid ``person_present: false`` response is preserved as confident
+        absence. Transport, CLI, or schema failures return an explicit unknown
+        result (``person_present: null`` and no ``not_visible`` claims) so a
+        caller can apply a REVIEW-oriented failure policy without mistaking a
+        failed detector for a confidently empty image.
+        """
+
+        image_path = Path(image).expanduser().resolve()
+        if not image_path.is_file():
+            raise CodexCLIError(f"image file was not found: {image_path}")
+        self.get_status(refresh=True)
+        try:
+            return self._request_json(
+                image_path,
+                schema=LOCALIZATION_OUTPUT_SCHEMA,
+                schema_name="localization",
+                output_name="localization.result.json",
+                prompt=self._localization_prompt(image_name or image_path.name),
+                parser=normalize_localization_payload,
+            )
+        except (CodexCLIError, OSError, ValueError) as exc:
+            return unknown_localization(f"localization failed: {type(exc).__name__}")
 
     analyze_image = classify_image
     classify = classify_image
@@ -366,6 +484,7 @@ class CodexCLIClient:
 
 __all__ = [
     "CLASSIFICATION_OUTPUT_SCHEMA",
+    "LOCALIZATION_OUTPUT_SCHEMA",
     "CodexCLIAuthError",
     "CodexCLIClient",
     "CodexCLIClientConfig",
